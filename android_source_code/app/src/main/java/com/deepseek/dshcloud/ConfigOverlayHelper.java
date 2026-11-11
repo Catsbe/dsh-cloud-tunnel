@@ -33,6 +33,7 @@ import java.util.List;
 public class ConfigOverlayHelper {
 
     public interface HostActions {
+        void onOpenQrScannerFromEditor();
         void onPickP12File(String targetProfileId);
         void onPickServerCaFile(String targetProfileId);
         void onRequestSystemCert(KeyChainAliasCallback cb);
@@ -119,9 +120,17 @@ public class ConfigOverlayHelper {
 
         // Card 1: Quick Import
         LinearLayout quickCard = makeCard();
-        quickCard.addView(makeSectionTitle("⚡ 一键导入电脑配置"));
-        TextView quickSub = makeHint("可在同一 Wi-Fi 下自动发现电脑，或粘贴 PC 端“云端穿透”里的手机配对码。");
+        quickCard.addView(makeSectionTitle("⚡ 一键扫码自动填入"));
+        TextView quickSub = makeHint("扫描电脑端「手机远程连接」二维码，全部地址与令牌会自动填入，无需手输。");
         quickCard.addView(quickSub);
+
+        Button btnScanQr = makeActionBtn("📷 扫电脑二维码自动填入", "#059669", "#FFFFFF");
+        btnScanQr.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        btnScanQr.setTypeface(Typeface.DEFAULT_BOLD);
+        LinearLayout.LayoutParams qrBtnLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        qrBtnLp.topMargin = dp(8);
+        btnScanQr.setOnClickListener(v -> host.onOpenQrScannerFromEditor());
+        quickCard.addView(btnScanQr, qrBtnLp);
 
         LinearLayout quickBtns = new LinearLayout(ctx);
         quickBtns.setOrientation(LinearLayout.HORIZONTAL);
@@ -150,28 +159,28 @@ public class ConfigOverlayHelper {
 
         // Card 2: Endpoints & Strategy
         LinearLayout netCard = makeCard();
-        netCard.addView(makeSectionTitle("🌐 双轨通道配置"));
+        netCard.addView(makeSectionTitle("🌐 连接地址与令牌（扫码自动填入）"));
 
-        netCard.addView(makeLabel("电脑备注名称"));
+        netCard.addView(makeLabel("电脑名称"));
         etName = makeInput("例如：办公电脑", false);
         netCard.addView(etName);
 
-        netCard.addView(makeLabel("局域网直连地址 (同 Wi-Fi 秒连，可填多个换行分隔)"));
+        netCard.addView(makeLabel("同一 Wi-Fi 直连地址 (免服务器，可多个换行分隔)"));
         etLanUrls = makeInput("例如：http://192.168.1.100:58000", true);
         etLanUrls.setMinLines(1);
         etLanUrls.setMaxLines(3);
         netCard.addView(etLanUrls);
 
-        netCard.addView(makeLabel("公网 mTLS 转发地址 (外出 4G/5G 走云服务器)"));
+        netCard.addView(makeLabel("云服务器中转地址 (外网 4G/5G 使用，仅同 Wi-Fi 可不填)"));
         etWanUrl = makeInput("例如：https://dsh.example.com:8443", false);
         netCard.addView(etWanUrl);
 
-        netCard.addView(makeLabel("网桥访问令牌 (Bridge Token，安全鉴权必填)"));
+        netCard.addView(makeLabel("连接令牌 (扫码自动获取，同一 Wi-Fi 直连凭此令牌认证)"));
         LinearLayout tokenRow = new LinearLayout(ctx);
         tokenRow.setOrientation(LinearLayout.HORIZONTAL);
         tokenRow.setGravity(Gravity.CENTER_VERTICAL);
 
-        etBridgeToken = makeInput("粘贴 PC 端配置码会自动填入，或手动粘贴 Token", false);
+        etBridgeToken = makeInput("扫码或粘贴配置码后自动填入", false);
         etBridgeToken.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         LinearLayout.LayoutParams tkLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         tkLp.rightMargin = dp(8);
@@ -221,8 +230,8 @@ public class ConfigOverlayHelper {
 
         // Card 3: mTLS Client Certificate
         LinearLayout certCard = makeCard();
-        certCard.addView(makeSectionTitle("🔐 mTLS 客户端可信证书"));
-        certCard.addView(makeHint("推荐直接导入 .p12 证书文件，App 将在底层自动完成双向 TLS 认证，告别系统弹窗；若之前已在手机系统设置安装过证书，也可直接绑定系统证书。"));
+        certCard.addView(makeSectionTitle("🔐 云服务器中转证书 (仅外网 4G/5G 需要)"));
+        certCard.addView(makeHint("若只在同 Wi-Fi 下直连可跳过；需要通过云服务器中转时，请导入 .p12 证书文件或绑定手机系统证书。"));
 
         tvCertStatus = new TextView(ctx);
         tvCertStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);

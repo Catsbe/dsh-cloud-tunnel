@@ -8,6 +8,8 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -26,6 +28,7 @@ import android.os.Looper;
 import android.provider.MediaStore;
 import android.security.KeyChain;
 import android.text.InputType;
+import android.util.Base64;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -34,6 +37,7 @@ import android.view.ViewGroup;
 import android.webkit.ClientCertRequest;
 import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
+import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.SslErrorHandler;
 import android.webkit.URLUtil;
@@ -54,6 +58,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -80,6 +85,8 @@ public class MainActivity extends Activity {
     private static final int REQ_PICK_SERVER_CA = 1002;
     private static final int REQ_WEB_FILE_CHOOSER = 1003;
     private static final int REQ_CAMERA_PERMISSION = 1004;
+    private static final int REQ_SCANNER_CAMERA = 1005;
+    private static final int REQ_PICK_QR_IMAGE = 1006;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean probingInFlight = new AtomicBoolean(false);
@@ -120,6 +127,11 @@ public class MainActivity extends Activity {
     private View configOverlayView;
     private boolean isConfigOpen = false;
     private String pendingCertTargetProfileId = "";
+
+    private FrameLayout scannerOverlay;
+    private WebView scannerWebView;
+    private boolean isScannerOpen = false;
+    private boolean scannerForEditOverlay = false;
 
     private volatile String activeBaseUrl = "";
     private volatile boolean activeIsLan = false;
@@ -177,13 +189,7 @@ public class MainActivity extends Activity {
         if (intent == null || intent.getData() == null) return;
         Uri data = intent.getData();
         if ("dsh-tunnel".equalsIgnoreCase(data.getScheme())) {
-            try {
-                TunnelConfig.PairingParseResult parsed = TunnelConfig.parsePairingCode(data.toString());
-                openConfigOverlay(TunnelConfig.newEmpty(), true);
-                configHelper.applyParsedPairing(parsed);
-            } catch (Exception e) {
-                toast("导入配对链接失败: " + e.getMessage());
-            }
+            handleScannedQrResult(data.toString());
         }
     }
 
@@ -226,6 +232,11 @@ public class MainActivity extends Activity {
 
         // 5. Setup / Config Overlay
         configHelper = new ConfigOverlayHelper(this, new ConfigOverlayHelper.HostActions() {
+            @Override
+            public void onOpenQrScannerFromEditor() {
+                startQrScanner(true);
+            }
+
             @Override
             public void onPickP12File(String targetProfileId) {
                 pendingCertTargetProfileId = targetProfileId;
@@ -303,7 +314,252 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
 
+        // 6. Camera / Gallery QR Scanner Overlay
+        scannerOverlay = buildScannerOverlay();
+        scannerOverlay.setVisibility(View.GONE);
+        rootLayout.addView(scannerOverlay, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+
         setContentView(rootLayout);
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private FrameLayout buildScannerOverlay() {
+        FrameLayout wrap = new FrameLayout(this);
+        wrap.setBackgroundColor(Color.parseColor("#0B0F19"));
+        wrap.setClickable(true);
+
+        scannerWebView = new WebView(this);
+        WebSettings ws = scannerWebView.getSettings();
+        ws.setJavaScriptEnabled(true);
+        ws.setMediaPlaybackRequiresUserGesture(false);
+        ws.setAllowFileAccess(false);
+        scannerWebView.setBackgroundColor(Color.parseColor("#0B0F19"));
+        scannerWebView.addJavascriptInterface(new Object() {
+            @JavascriptInterface
+            public void onQrDetected(String code) {
+                mainHandler.post(() -> {
+                    stopQrScanner();
+                    handleScannedQrResult(code);
+                });
+            }
+
+            @JavascriptInterface
+            public void onCloseScanner() {
+                mainHandler.post(() -> stopQrScanner());
+            }
+
+            @JavascriptInterface
+            public void onPickQrImage() {
+                mainHandler.post(() -> {
+                    Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    intent.setType("image/*");
+                    startActivityForResult(Intent.createChooser(intent, "选择电脑配对二维码图片"), REQ_PICK_QR_IMAGE);
+                });
+            }
+
+            @JavascriptInterface
+            public void onPasteManual() {
+                mainHandler.post(() -> {
+                    stopQrScanner();
+                    showPastePairingDialog();
+                });
+            }
+        }, "AndroidScanner");
+
+        scannerWebView.setWebViewClient(new WebViewClient() {
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                if (request != null && request.getUrl() != null) {
+                    String u = request.getUrl().toString();
+                    if ("https://localhost/jsqr.js".equals(u)) {
+                        try {
+                            InputStream is = getResources().openRawResource(R.raw.jsqr);
+                            return new WebResourceResponse("application/javascript", "UTF-8", is);
+                        } catch (Exception ignored) {
+                        }
+                    }
+                }
+                return super.shouldInterceptRequest(view, request);
+            }
+        });
+
+        scannerWebView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onPermissionRequest(PermissionRequest request) {
+                mainHandler.post(() -> request.grant(request.getResources()));
+            }
+        });
+
+        wrap.addView(scannerWebView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+        return wrap;
+    }
+
+    private void startQrScanner(boolean forEditOverlay) {
+        scannerForEditOverlay = forEditOverlay;
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, REQ_SCANNER_CAMERA);
+        } else {
+            openScannerView();
+        }
+    }
+
+    private void openScannerView() {
+        isScannerOpen = true;
+        scannerOverlay.setVisibility(View.VISIBLE);
+        String html = "<!doctype html><html><head><meta charset='utf-8'>"
+                + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                + "<script src='https://localhost/jsqr.js'></script>"
+                + "<style>"
+                + "body{margin:0;background:#0b0f19;color:#f8fafc;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:18px;box-sizing:border-box;}"
+                + "#box{position:relative;width:78vw;max-width:300px;height:78vw;max-height:300px;border:2px solid #10b981;border-radius:18px;overflow:hidden;background:#111827;box-shadow:0 0 28px rgba(16,185,129,.22);}"
+                + "video{width:100%;height:100%;object-fit:cover;}"
+                + ".btn{margin-top:11px;padding:11px 16px;border-radius:10px;border:none;font-size:13px;font-weight:600;cursor:pointer;width:82vw;max-width:310px;}"
+                + "</style></head><body>"
+                + "<div style='font-size:18px;font-weight:700;margin-bottom:6px;'>📷 扫描电脑配对二维码</div>"
+                + "<div id='tip' style='font-size:12px;color:#94a3b8;margin-bottom:14px;text-align:center;line-height:1.45;'>对准电脑端「手机远程连接」面板的二维码<br>扫完后将自动填入全部地址与令牌</div>"
+                + "<div id='box'><video id='v' playsinline muted></video></div>"
+                + "<canvas id='c' style='display:none;'></canvas>"
+                + "<button class='btn' style='background:#0284c7;color:#fff;' onclick='AndroidScanner.onPickQrImage()'>🖼️ 从相册选二维码图片</button>"
+                + "<button class='btn' style='background:#2563eb;color:#fff;' onclick='AndroidScanner.onPasteManual()'>📋 粘贴配对码 (dsh-tunnel://)</button>"
+                + "<button class='btn' style='background:#1e293b;color:#cbd5e1;border:1px solid #334155;' onclick='AndroidScanner.onCloseScanner()'>取消返回</button>"
+                + "<script>"
+                + "var v=document.getElementById('v'),c=document.getElementById('c'),ctx=c.getContext('2d',{willReadFrequently:true});"
+                + "var scanning=true,activeStream=null,lastTick=0,frameCount=0;"
+                + "var detector=null;"
+                + "if('BarcodeDetector' in window){try{detector=new BarcodeDetector({formats:['qr_code']});}catch(_){detector=null;}}"
+                + "function stopStream(){scanning=false;if(activeStream){activeStream.getTracks().forEach(function(t){try{t.stop();}catch(_){}});activeStream=null;}}"
+                + "function hit(val){if(!scanning||!val)return;scanning=false;stopStream();AndroidScanner.onQrDetected(String(val));}"
+                + "function decodeImageDataUrl(dataUrl){var img=new Image();img.onload=function(){var maxDim=900,scale=Math.min(1,maxDim/Math.max(img.width,img.height));c.width=Math.max(1,Math.round(img.width*scale));c.height=Math.max(1,Math.round(img.height*scale));ctx.drawImage(img,0,0,c.width,c.height);var id=ctx.getImageData(0,0,c.width,c.height);if(window.jsQR){var r=jsQR(id.data,id.width,id.height,{inversionAttempts:'attemptBoth'});if(r&&r.data){hit(r.data);return;}}document.getElementById('tip').innerText='未能从该图片中识别到有效二维码，请换一张清晰截图';};img.src=dataUrl;}"
+                + "if(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia){"
+                + "  navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}}})"
+                + "  .then(function(s){activeStream=s;v.srcObject=s;v.play();requestAnimationFrame(tick);})"
+                + "  .catch(function(){document.getElementById('tip').innerText='摄像头暂不可用，可点击下方「从相册选二维码图片」或「粘贴配对码」';});"
+                + "}else{document.getElementById('tip').innerText='当前环境不支持摄像头预览，可从相册选图或粘贴配对码';}"
+                + "function tick(ts){"
+                + "  if(!scanning)return;"
+                + "  if(ts-lastTick>=90 && v.readyState>=2 && v.videoWidth>0){"
+                + "    lastTick=ts;frameCount++;"
+                + "    if(detector && frameCount%2===1){"
+                + "      detector.detect(v).then(function(codes){if(codes&&codes.length>0&&codes[0].rawValue){hit(codes[0].rawValue);}}).catch(function(){});"
+                + "    }"
+                + "    if(scanning && window.jsQR){"
+                + "      var maxS=640,sc=Math.min(1,maxS/Math.max(v.videoWidth,v.videoHeight));"
+                + "      var w=Math.max(1,Math.round(v.videoWidth*sc)),h=Math.max(1,Math.round(v.videoHeight*sc));"
+                + "      if(c.width!==w||c.height!==h){c.width=w;c.height=h;}"
+                + "      ctx.drawImage(v,0,0,w,h);"
+                + "      var imgData=ctx.getImageData(0,0,w,h);"
+                + "      var inv=(frameCount%6===0)?'attemptBoth':'dontInvert';"
+                + "      var res=jsQR(imgData.data,w,h,{inversionAttempts:inv});"
+                + "      if(res&&res.data){hit(res.data);return;}"
+                + "    }"
+                + "  }"
+                + "  if(scanning)requestAnimationFrame(tick);"
+                + "}"
+                + "</script></body></html>";
+        scannerWebView.loadDataWithBaseURL("https://localhost/", html, "text/html", "UTF-8", null);
+    }
+
+    private void stopQrScanner() {
+        isScannerOpen = false;
+        if (scannerWebView != null) {
+            scannerWebView.evaluateJavascript("try{stopStream();}catch(e){}", null);
+            scannerWebView.loadUrl("about:blank");
+        }
+        if (scannerOverlay != null) {
+            scannerOverlay.setVisibility(View.GONE);
+        }
+    }
+
+    private void showPastePairingDialog() {
+        EditText input = new EditText(this);
+        input.setHint("粘贴 dsh-tunnel://cfg?d=... 配对码");
+        input.setMinLines(2);
+        input.setMaxLines(4);
+        try {
+            android.content.ClipboardManager cm = (android.content.ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm != null && cm.hasPrimaryClip() && cm.getPrimaryClip() != null && cm.getPrimaryClip().getItemCount() > 0) {
+                CharSequence t = cm.getPrimaryClip().getItemAt(0).coerceToText(this);
+                if (t != null && t.toString().trim().startsWith("dsh-tunnel://")) {
+                    input.setText(t.toString().trim());
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setPadding(dp(20), dp(12), dp(20), 0);
+        wrap.addView(input, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        new AlertDialog.Builder(this)
+                .setTitle("粘贴电脑端配对码")
+                .setView(wrap)
+                .setPositiveButton("自动导入", (d, w) -> handleScannedQrResult(input.getText().toString().trim()))
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void handleScannedQrResult(String rawCode) {
+        try {
+            TunnelConfig.PairingParseResult parsed = TunnelConfig.parsePairingCode(rawCode);
+            if (scannerForEditOverlay || isConfigOpen) {
+                if (!isConfigOpen) openConfigOverlay(TunnelConfig.newEmpty(), true);
+                configHelper.applyParsedPairing(parsed);
+                return;
+            }
+
+            // Auto-save into Device Center & verify immediately
+            TunnelConfig target = findExistingProfileForPairing(parsed);
+            boolean isUpdate = (target != null);
+            if (target == null) {
+                target = TunnelConfig.newEmpty();
+            }
+            if (parsed.name != null && !parsed.name.isEmpty()) target.profileName = parsed.name;
+            if (parsed.localPort > 0) target.defaultLocalPort = parsed.localPort;
+            if (parsed.lanUrlsProvided) {
+                target.lanUrlsRaw = parsed.lanUrlsJoined == null ? "" : parsed.lanUrlsJoined;
+            } else if (parsed.lanUrlsJoined != null && !parsed.lanUrlsJoined.isEmpty()) {
+                target.lanUrlsRaw = parsed.lanUrlsJoined;
+            }
+            if (parsed.wanUrl != null && !parsed.wanUrl.isEmpty()) target.wanUrl = parsed.wanUrl;
+            if (parsed.bridgeToken != null && !parsed.bridgeToken.isEmpty()) target.bridgeToken = parsed.bridgeToken;
+
+            target.save(this);
+            reloadBoundProfiles();
+            showDeviceCenter(true);
+
+            boolean hasLan = !target.getNormalizedLanUrls().isEmpty();
+            boolean hasWan = !target.getNormalizedWanUrl().isEmpty();
+            if (hasLan && (!hasWan || TunnelConfig.CERT_NONE.equals(target.certMode))) {
+                toast((isUpdate ? "已更新「" : "已扫码绑定「") + target.profileName + "」并导入令牌，同 Wi-Fi 下可直接连接！");
+            } else {
+                toast((isUpdate ? "已更新「" : "已扫码绑定「") + target.profileName + "」，正在探测在线状态...");
+            }
+        } catch (Exception e) {
+            toast("无法识别配对二维码: " + e.getMessage());
+        }
+    }
+
+    private TunnelConfig findExistingProfileForPairing(TunnelConfig.PairingParseResult parsed) {
+        for (TunnelConfig p : boundProfiles) {
+            if (parsed.bridgeToken != null && !parsed.bridgeToken.isEmpty()
+                    && parsed.bridgeToken.equals(p.bridgeToken)) {
+                return p;
+            }
+        }
+        for (TunnelConfig p : boundProfiles) {
+            String pWan = p.getNormalizedWanUrl();
+            if (parsed.wanUrl != null && !parsed.wanUrl.isEmpty() && parsed.wanUrl.equals(pWan)
+                    && parsed.name != null && parsed.name.equals(p.profileName)) {
+                return p;
+            }
+        }
+        return null;
     }
 
     private LinearLayout buildDeviceCenterOverlay() {
@@ -330,31 +586,37 @@ public class MainActivity extends Activity {
         sumLp.bottomMargin = dp(12);
         root.addView(tvDeviceSummary, sumLp);
 
-        // Primary Add button
-        Button btnAdd = makeStyledBtn("➕ 绑定新电脑 (粘贴配对码 / 手动配置)", "#059669", "#FFFFFF");
+        // Primary Add button -> Camera QR Scan
+        Button btnAdd = makeStyledBtn("📷 扫码绑定电脑 (扫完自动填入，同 Wi-Fi 免证书)", "#059669", "#FFFFFF");
         btnAdd.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         btnAdd.setTypeface(Typeface.DEFAULT_BOLD);
-        btnAdd.setOnClickListener(v -> openConfigOverlay(TunnelConfig.newEmpty(), true));
-        LinearLayout.LayoutParams addLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
+        btnAdd.setOnClickListener(v -> startQrScanner(false));
+        LinearLayout.LayoutParams addLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46));
         addLp.bottomMargin = dp(10);
         root.addView(btnAdd, addLp);
 
-        // Refresh & LAN Scan Row
+        // Refresh, LAN Scan & Manual Add Row
         LinearLayout toolsRow = new LinearLayout(this);
         toolsRow.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams trLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         trLp.bottomMargin = dp(12);
 
-        btnRefreshAll = makeStyledBtn("🔄 刷新在线状态", "#2563EB", "#FFFFFF");
+        btnRefreshAll = makeStyledBtn("🔄 刷新状态", "#2563EB", "#FFFFFF");
         btnRefreshAll.setOnClickListener(v -> probeAllBoundProfiles());
-        LinearLayout.LayoutParams rLp = new LinearLayout.LayoutParams(0, dp(40), 1f);
-        rLp.rightMargin = dp(8);
+        LinearLayout.LayoutParams rLp = new LinearLayout.LayoutParams(0, dp(38), 1f);
+        rLp.rightMargin = dp(6);
         toolsRow.addView(btnRefreshAll, rLp);
 
-        btnScanLanDevices = makeStyledBtn("🔍 扫描局域网", "#0284C7", "#FFFFFF");
+        btnScanLanDevices = makeStyledBtn("🔍 扫局域网", "#0284C7", "#FFFFFF");
         btnScanLanDevices.setOnClickListener(v -> runDeviceCenterLanScan());
-        LinearLayout.LayoutParams sLp = new LinearLayout.LayoutParams(0, dp(40), 1f);
+        LinearLayout.LayoutParams sLp = new LinearLayout.LayoutParams(0, dp(38), 1f);
+        sLp.rightMargin = dp(6);
         toolsRow.addView(btnScanLanDevices, sLp);
+
+        Button btnManualAdd = makeStyledBtn("✏️ 手动添加", "#334155", "#E2E8F0");
+        btnManualAdd.setOnClickListener(v -> openConfigOverlay(TunnelConfig.newEmpty(), true));
+        LinearLayout.LayoutParams mLp = new LinearLayout.LayoutParams(0, dp(38), 1f);
+        toolsRow.addView(btnManualAdd, mLp);
         root.addView(toolsRow, trLp);
 
         // Scrollable Lists
@@ -589,24 +851,27 @@ public class MainActivity extends Activity {
             StringBuilder sb = new StringBuilder();
             if (isProbing) {
                 tvInfo.setTextColor(Color.parseColor("#FCD34D"));
-                sb.append("⏳ 正在探测局域网与公网 mTLS 可达性...");
+                sb.append("⏳ 正在检测同 Wi-Fi 直连与云服务器可达性...");
             } else {
                 tvInfo.setTextColor(Color.parseColor("#CBD5E1"));
-                sb.append("📶 局域网: ");
+                sb.append("📶 同 Wi-Fi 直连: ");
                 if (st.lanResult != null && st.lanResult.ok) {
                     sb.append("✅ 可直连 (").append(st.lanResult.latencyMs).append("ms) · ").append(st.lanResult.url);
                 } else {
                     sb.append(st.lanResult != null ? st.lanResult.errorDetail : "未配置");
                 }
-                sb.append("\n☁️ 公网 mTLS: ");
+                sb.append("\n☁️ 云服务器中转: ");
                 if (st.wanResult != null && st.wanResult.ok) {
                     sb.append("✅ 可连接 (").append(st.wanResult.latencyMs).append("ms) · ").append(st.wanResult.url);
                 } else {
                     sb.append(st.wanResult != null ? st.wanResult.errorDetail : "未配置");
                 }
+                if (!p.getNormalizedWanUrl().isEmpty() && TunnelConfig.CERT_NONE.equals(p.certMode)) {
+                    sb.append("\n🔐 提示：走云服务器中转（4G/5G）前请先点右上角「⚙️ 设置」选定 .p12 证书");
+                }
             }
             if (p.bridgeToken == null || p.bridgeToken.trim().isEmpty()) {
-                sb.append("\n⚠️ 尚未配置 Bridge Token");
+                sb.append("\n⚠️ 尚未获取连接令牌，请重新扫电脑二维码");
             }
             tvInfo.setText(sb.toString());
             card.addView(tvInfo);
@@ -619,27 +884,45 @@ public class MainActivity extends Activity {
             boolean wanOk = st != null && st.isWanOk();
 
             if (lanOk && wanOk) {
-                Button bLan = makeStyledBtn("📶 局域网连接 (" + st.lanResult.latencyMs + "ms)", "#059669", "#FFFFFF");
+                Button bLan = makeStyledBtn("📶 同 Wi-Fi 直连 (" + st.lanResult.latencyMs + "ms)", "#059669", "#FFFFFF");
                 bLan.setOnClickListener(v -> connectToProfile(p, TunnelConfig.ROUTE_LAN_ONLY));
                 LinearLayout.LayoutParams lp1 = new LinearLayout.LayoutParams(0, dp(40), 1f);
                 lp1.rightMargin = dp(8);
                 btnRow.addView(bLan, lp1);
 
-                Button bWan = makeStyledBtn("☁️ 公网连接 (" + st.wanResult.latencyMs + "ms)", "#0284C7", "#FFFFFF");
+                Button bWan = makeStyledBtn("☁️ 云服务器连接 (" + st.wanResult.latencyMs + "ms)", "#0284C7", "#FFFFFF");
                 bWan.setOnClickListener(v -> connectToProfile(p, TunnelConfig.ROUTE_WAN_ONLY));
                 btnRow.addView(bWan, new LinearLayout.LayoutParams(0, dp(40), 1f));
             } else if (lanOk) {
-                Button bLan = makeStyledBtn("📶 连接局域网直连 (" + st.lanResult.latencyMs + "ms)", "#059669", "#FFFFFF");
-                bLan.setOnClickListener(v -> connectToProfile(p, null));
-                btnRow.addView(bLan, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
+                Button bLan = makeStyledBtn("📶 同 Wi-Fi 直连 (" + st.lanResult.latencyMs + "ms)", "#059669", "#FFFFFF");
+                bLan.setOnClickListener(v -> connectToProfile(p, TunnelConfig.ROUTE_LAN_ONLY));
+                if (!p.getNormalizedWanUrl().isEmpty() && TunnelConfig.CERT_NONE.equals(p.certMode)) {
+                    LinearLayout.LayoutParams lp1 = new LinearLayout.LayoutParams(0, dp(40), 1f);
+                    lp1.rightMargin = dp(8);
+                    btnRow.addView(bLan, lp1);
+                    Button bCert = makeStyledBtn("🔐 选定 .p12 证书", "#334155", "#FCD34D");
+                    bCert.setOnClickListener(v -> openConfigOverlay(p, false));
+                    btnRow.addView(bCert, new LinearLayout.LayoutParams(0, dp(40), 1f));
+                } else {
+                    btnRow.addView(bLan, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
+                }
             } else if (wanOk) {
-                Button bWan = makeStyledBtn("☁️ 连接公网 mTLS (" + st.wanResult.latencyMs + "ms)", "#0284C7", "#FFFFFF");
-                bWan.setOnClickListener(v -> connectToProfile(p, null));
+                Button bWan = makeStyledBtn("☁️ 云服务器连接 (" + st.wanResult.latencyMs + "ms)", "#0284C7", "#FFFFFF");
+                bWan.setOnClickListener(v -> connectToProfile(p, TunnelConfig.ROUTE_WAN_ONLY));
                 btnRow.addView(bWan, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
             } else {
                 Button bTry = makeStyledBtn(isProbing ? "⚡ 直接尝试连接" : "🔄 尝试重连此电脑", "#334155", "#E2E8F0");
                 bTry.setOnClickListener(v -> connectToProfile(p, null));
-                btnRow.addView(bTry, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
+                if (!p.getNormalizedWanUrl().isEmpty() && TunnelConfig.CERT_NONE.equals(p.certMode)) {
+                    LinearLayout.LayoutParams lp1 = new LinearLayout.LayoutParams(0, dp(40), 1f);
+                    lp1.rightMargin = dp(8);
+                    btnRow.addView(bTry, lp1);
+                    Button bCert = makeStyledBtn("🔐 选定 .p12 证书", "#334155", "#FCD34D");
+                    bCert.setOnClickListener(v -> openConfigOverlay(p, false));
+                    btnRow.addView(bCert, new LinearLayout.LayoutParams(0, dp(40), 1f));
+                } else {
+                    btnRow.addView(bTry, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
+                }
             }
 
             card.addView(btnRow);
@@ -1494,6 +1777,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        stopQrScanner();
         if (connectivityManager != null && networkCallback != null) {
             try {
                 connectivityManager.unregisterNetworkCallback(networkCallback);
@@ -1612,6 +1896,34 @@ public class MainActivity extends Activity {
 
         if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
+        if (requestCode == REQ_PICK_QR_IMAGE) {
+            new Thread(() -> {
+                try (InputStream is = getContentResolver().openInputStream(uri)) {
+                    if (is == null) return;
+                    BitmapFactory.Options opts = new BitmapFactory.Options();
+                    opts.inJustDecodeBounds = true;
+                    byte[] rawBytes = readSmallBytes(is, 12 * 1024 * 1024);
+                    BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.length, opts);
+                    int sample = 1;
+                    int maxDim = Math.max(opts.outWidth, opts.outHeight);
+                    while (maxDim / sample > 1200) sample *= 2;
+                    BitmapFactory.Options opts2 = new BitmapFactory.Options();
+                    opts2.inSampleSize = sample;
+                    Bitmap bmp = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.length, opts2);
+                    if (bmp == null) throw new IllegalArgumentException("无法读取图片");
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    bmp.compress(Bitmap.CompressFormat.PNG, 100, baos);
+                    bmp.recycle();
+                    String b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP);
+                    String js = "decodeImageDataUrl('data:image/png;base64," + b64 + "')";
+                    mainHandler.post(() -> scannerWebView.evaluateJavascript(js, null));
+                } catch (Exception e) {
+                    mainHandler.post(() -> toast("读取二维码图片失败: " + e.getMessage()));
+                }
+            }, "dsh-qr-img").start();
+            return;
+        }
+
         String targetPid = (pendingCertTargetProfileId != null && !pendingCertTargetProfileId.isEmpty())
                 ? pendingCertTargetProfileId
                 : configHelper.getDraftProfileId();
@@ -1633,6 +1945,19 @@ public class MainActivity extends Activity {
                 }
             }).start();
         }
+    }
+
+    private static byte[] readSmallBytes(InputStream is, int maxBytes) throws Exception {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int total = 0;
+        int n;
+        while ((n = is.read(buf)) != -1) {
+            total += n;
+            if (total > maxBytes) throw new IllegalArgumentException("图片过大");
+            baos.write(buf, 0, n);
+        }
+        return baos.toByteArray();
     }
 
     private void tryImportP12WithPassword(String targetPid, Uri uri, String password, boolean promptOnFailure) {
@@ -1686,6 +2011,15 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_SCANNER_CAMERA) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                openScannerView();
+            } else {
+                toast("未授予摄像头权限，您仍可在扫码页「从相册选图」或「粘贴配对码」");
+                openScannerView();
+            }
+            return;
+        }
         if (requestCode == REQ_CAMERA_PERMISSION && pendingWebPermissionRequest != null) {
             if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 pendingWebPermissionRequest.grant(pendingWebPermissionRequest.getResources());
@@ -1698,6 +2032,10 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        if (isScannerOpen) {
+            stopQrScanner();
+            return;
+        }
         if (isConfigOpen) {
             closeConfigOverlay();
             return;

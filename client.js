@@ -7,6 +7,361 @@ window.__ModuleLoader__.load({
     var React = require("react");
     var inject = ["slots"];
 
+    // Self-contained ISO-18004 QR Code SVG generator (Byte mode, ECC Level L, Versions 1..20)
+    var encodeQrSvgDataUri = (function () {
+      var EXP = new Uint8Array(512);
+      var LOG = new Uint8Array(256);
+      var x = 1;
+      for (var i = 0; i < 255; i++) {
+        EXP[i] = x;
+        LOG[x] = i;
+        x <<= 1;
+        if (x & 0x100) x ^= 0x11d;
+      }
+      for (var j = 255; j < 512; j++) EXP[j] = EXP[j - 255];
+
+      function gfMul(a, b) {
+        if (a === 0 || b === 0) return 0;
+        return EXP[LOG[a] + LOG[b]];
+      }
+
+      function rsPoly(ecLen) {
+        var p = [1];
+        for (var i = 0; i < ecLen; i++) {
+          var next = new Array(p.length + 1).fill(0);
+          var factor = EXP[i];
+          for (var j = 0; j < p.length; j++) {
+            next[j] ^= p[j];
+            next[j + 1] ^= gfMul(p[j], factor);
+          }
+          p = next;
+        }
+        return p;
+      }
+
+      function rsEncode(data, ecLen) {
+        var gen = rsPoly(ecLen);
+        var res = new Uint8Array(data.length + ecLen);
+        res.set(data);
+        for (var i = 0; i < data.length; i++) {
+          var coef = res[i];
+          if (coef !== 0) {
+            for (var j = 0; j < gen.length; j++) {
+              res[i + j] ^= gfMul(gen[j], coef);
+            }
+          }
+        }
+        return res.slice(data.length);
+      }
+
+      var VERSIONS = [
+        null,
+        [26, 7, 1, 19, 0, 0], [44, 10, 1, 34, 0, 0], [70, 15, 1, 55, 0, 0],
+        [100, 20, 1, 80, 0, 0], [134, 26, 1, 108, 0, 0], [172, 18, 2, 68, 0, 0],
+        [196, 20, 2, 78, 0, 0], [242, 24, 2, 97, 0, 0], [292, 30, 2, 116, 0, 0],
+        [346, 18, 2, 68, 2, 69], [404, 20, 4, 81, 0, 0], [466, 24, 2, 92, 2, 93],
+        [532, 26, 4, 107, 0, 0], [581, 30, 3, 115, 1, 116], [655, 22, 5, 87, 1, 88],
+        [733, 24, 5, 98, 1, 99], [815, 28, 1, 107, 5, 108], [901, 30, 5, 120, 1, 121],
+        [991, 28, 3, 113, 4, 114], [1085, 28, 3, 107, 5, 108]
+      ];
+
+      var ALIGN_POS = [
+        null,
+        [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34],
+        [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50],
+        [6, 30, 54], [6, 32, 58], [6, 34, 62],
+        [6, 26, 46, 66], [6, 26, 48, 70], [6, 26, 50, 74],
+        [6, 30, 54, 78], [6, 30, 56, 82], [6, 30, 58, 86], [6, 34, 62, 90]
+      ];
+
+      function encode(text) {
+        var bytes = new TextEncoder().encode(text);
+        var ver = 1;
+        for (; ver < VERSIONS.length; ver++) {
+          var info = VERSIONS[ver];
+          var dataCap = info[2] * info[3] + info[4] * info[5];
+          var lenBits = ver < 10 ? 8 : 16;
+          if (4 + lenBits + bytes.length * 8 <= dataCap * 8) break;
+        }
+        if (ver >= VERSIONS.length) return "";
+
+        var vInfo = VERSIONS[ver];
+        var ecPerBlk = vInfo[1], b1 = vInfo[2], d1 = vInfo[3], b2 = vInfo[4], d2 = vInfo[5];
+        var dataCapBytes = b1 * d1 + b2 * d2;
+        var lenBits2 = ver < 10 ? 8 : 16;
+
+        var bits = [];
+        function pushBits(val, n) {
+          for (var k = n - 1; k >= 0; k--) bits.push((val >> k) & 1);
+        }
+        pushBits(4, 4);
+        pushBits(bytes.length, lenBits2);
+        for (var i = 0; i < bytes.length; i++) pushBits(bytes[i], 8);
+        var maxBits = dataCapBytes * 8;
+        var termLen = Math.min(4, maxBits - bits.length);
+        for (var t = 0; t < termLen; t++) bits.push(0);
+        while (bits.length % 8 !== 0) bits.push(0);
+        var padBytes = [0xec, 0x11];
+        var pi = 0;
+        while (bits.length < maxBits) {
+          pushBits(padBytes[pi % 2], 8);
+          pi++;
+        }
+
+        var dataBytes = new Uint8Array(dataCapBytes);
+        for (var i2 = 0; i2 < dataCapBytes; i2++) {
+          var v = 0;
+          for (var b = 0; b < 8; b++) v = (v << 1) | bits[i2 * 8 + b];
+          dataBytes[i2] = v;
+        }
+
+        var blocks = [];
+        var ecs = [];
+        var offset = 0;
+        for (var bi = 0; bi < b1; bi++) {
+          var sl = dataBytes.slice(offset, offset + d1);
+          offset += d1;
+          blocks.push(sl);
+          ecs.push(rsEncode(sl, ecPerBlk));
+        }
+        for (var bi2 = 0; bi2 < b2; bi2++) {
+          var sl2 = dataBytes.slice(offset, offset + d2);
+          offset += d2;
+          blocks.push(sl2);
+          ecs.push(rsEncode(sl2, ecPerBlk));
+        }
+
+        var interleaved = [];
+        var maxD = Math.max(d1, d2);
+        for (var col = 0; col < maxD; col++) {
+          for (var blkIdx = 0; blkIdx < blocks.length; blkIdx++) {
+            if (col < blocks[blkIdx].length) interleaved.push(blocks[blkIdx][col]);
+          }
+        }
+        for (var eCol = 0; eCol < ecPerBlk; eCol++) {
+          for (var ecIdx = 0; ecIdx < ecs.length; ecIdx++) {
+            interleaved.push(ecs[ecIdx][eCol]);
+          }
+        }
+
+        var codeBits = [];
+        for (var ci = 0; ci < interleaved.length; ci++) {
+          var cw = interleaved[ci];
+          for (var kb = 7; kb >= 0; kb--) codeBits.push((cw >> kb) & 1);
+        }
+        var remBits = ver === 1 ? 0 : (ver <= 6 ? 7 : (ver <= 13 ? 0 : 3));
+        for (var rb = 0; rb < remBits; rb++) codeBits.push(0);
+
+        var size = ver * 4 + 17;
+        var base = [];
+        var func = [];
+        for (var rr = 0; rr < size; rr++) {
+          base.push(new Int8Array(size).fill(-1));
+          func.push(new Uint8Array(size));
+        }
+
+        function setFunc(r, c, dark) {
+          if (r < 0 || c < 0 || r >= size || c >= size) return;
+          base[r][c] = dark ? 1 : 0;
+          func[r][c] = 1;
+        }
+
+        function placeFinder(top, left) {
+          for (var dr = -1; dr <= 7; dr++) {
+            for (var dc = -1; dc <= 7; dc++) {
+              var r = top + dr, c = left + dc;
+              if (r < 0 || c < 0 || r >= size || c >= size) continue;
+              var inBox = dr >= 0 && dr <= 6 && dc >= 0 && dc <= 6;
+              var dark = inBox && (
+                dr === 0 || dr === 6 || dc === 0 || dc === 6 ||
+                (dr >= 2 && dr <= 4 && dc >= 2 && dc <= 4)
+              );
+              setFunc(r, c, dark);
+            }
+          }
+        }
+
+        placeFinder(0, 0);
+        placeFinder(0, size - 7);
+        placeFinder(size - 7, 0);
+
+        var pos = ALIGN_POS[ver];
+        for (var pr = 0; pr < pos.length; pr++) {
+          for (var pc = 0; pc < pos.length; pc++) {
+            var ar = pos[pr], ac = pos[pc];
+            if (func[ar][ac]) continue;
+            for (var adr = -2; adr <= 2; adr++) {
+              for (var adc = -2; adc <= 2; adc++) {
+                setFunc(ar + adr, ac + adc, Math.max(Math.abs(adr), Math.abs(adc)) !== 1);
+              }
+            }
+          }
+        }
+
+        for (var ti = 8; ti < size - 8; ti++) {
+          if (!func[6][ti]) setFunc(6, ti, ti % 2 === 0);
+          if (!func[ti][6]) setFunc(ti, 6, ti % 2 === 0);
+        }
+
+        setFunc(size - 8, 8, true);
+        for (var fi = 0; fi < 9; fi++) {
+          if (fi !== 6) {
+            if (!func[8][fi]) setFunc(8, fi, false);
+            if (!func[fi][8]) setFunc(fi, 8, false);
+          }
+        }
+        for (var fi2 = 0; fi2 < 8; fi2++) {
+          if (!func[8][size - 1 - fi2]) setFunc(8, size - 1 - fi2, false);
+          if (fi2 < 7 && !func[size - 1 - fi2][8]) setFunc(size - 1 - fi2, 8, false);
+        }
+
+        if (ver >= 7) {
+          var vRem = ver;
+          for (var vi = 0; vi < 12; vi++) vRem = (vRem << 1) ^ (((vRem >> 11) & 1) * 0x1f25);
+          var vBits = (ver << 12) | vRem;
+          for (var vi2 = 0; vi2 < 18; vi2++) {
+            var bit = ((vBits >> vi2) & 1) === 1;
+            var a = Math.floor(vi2 / 3), b2pos = (vi2 % 3) + size - 11;
+            setFunc(a, b2pos, bit);
+            setFunc(b2pos, a, bit);
+          }
+        }
+
+        var bitIdx = 0;
+        var upward = true;
+        for (var right = size - 1; right >= 1; right -= 2) {
+          if (right === 6) right = 5;
+          for (var zi = 0; zi < size; zi++) {
+            var zr = upward ? (size - 1 - zi) : zi;
+            for (var lr = 0; lr < 2; lr++) {
+              var zc = right - lr;
+              if (!func[zr][zc]) {
+                base[zr][zc] = bitIdx < codeBits.length ? codeBits[bitIdx++] : 0;
+              }
+            }
+          }
+          upward = !upward;
+        }
+
+        var maskFn = [
+          function (r, c) { return (r + c) % 2 === 0; },
+          function (r, c) { return r % 2 === 0; },
+          function (r, c) { return c % 3 === 0; },
+          function (r, c) { return (r + c) % 3 === 0; },
+          function (r, c) { return (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0; },
+          function (r, c) { return ((r * c) % 2) + ((r * c) % 3) === 0; },
+          function (r, c) { return (((r * c) % 2) + ((r * c) % 3)) % 2 === 0; },
+          function (r, c) { return (((r + c) % 2) + ((r * c) % 3)) % 2 === 0; }
+        ];
+
+        function applyFormat(grid, maskId) {
+          var fmtData = (1 << 3) | maskId;
+          var rem = fmtData << 10;
+          for (var i = 14; i >= 10; i--) {
+            if ((rem >> i) & 1) rem ^= (0x537 << (i - 10));
+          }
+          var fmt = ((fmtData << 10) | rem) ^ 0x5412;
+          for (var k = 0; k < 15; k++) {
+            var dark = ((fmt >> k) & 1) === 1 ? 1 : 0;
+            if (k < 6) grid[k][8] = dark;
+            else if (k === 6) grid[7][8] = dark;
+            else if (k === 7) grid[8][8] = dark;
+            else if (k === 8) grid[8][7] = dark;
+            else grid[8][14 - k] = dark;
+
+            if (k < 8) grid[8][size - 1 - k] = dark;
+            else grid[size - 15 + k][8] = dark;
+          }
+        }
+
+        function penalty(g) {
+          var score = 0;
+          for (var r = 0; r < size; r++) {
+            var run = 1;
+            for (var c = 1; c < size; c++) {
+              if (g[r][c] === g[r][c - 1]) {
+                run++;
+                if (run === 5) score += 3;
+                else if (run > 5) score += 1;
+              } else run = 1;
+            }
+          }
+          for (var c2 = 0; c2 < size; c2++) {
+            var run2 = 1;
+            for (var r2 = 1; r2 < size; r2++) {
+              if (g[r2][c2] === g[r2 - 1][c2]) {
+                run2++;
+                if (run2 === 5) score += 3;
+                else if (run2 > 5) score += 1;
+              } else run2 = 1;
+            }
+          }
+          for (var r3 = 0; r3 < size - 1; r3++) {
+            for (var c3 = 0; c3 < size - 1; c3++) {
+              var val = g[r3][c3];
+              if (val === g[r3][c3 + 1] && val === g[r3 + 1][c3] && val === g[r3 + 1][c3 + 1]) score += 3;
+            }
+          }
+          var p1 = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0];
+          var p2 = [0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1];
+          for (var r4 = 0; r4 < size; r4++) {
+            for (var c4 = 0; c4 <= size - 11; c4++) {
+              var m1 = true, m2 = true, m3 = true, m4 = true;
+              for (var k = 0; k < 11; k++) {
+                if (g[r4][c4 + k] !== p1[k]) m1 = false;
+                if (g[r4][c4 + k] !== p2[k]) m2 = false;
+                if (g[c4 + k][r4] !== p1[k]) m3 = false;
+                if (g[c4 + k][r4] !== p2[k]) m4 = false;
+              }
+              if (m1 || m2) score += 40;
+              if (m3 || m4) score += 40;
+            }
+          }
+          var darkCount = 0;
+          for (var r5 = 0; r5 < size; r5++) for (var c5 = 0; c5 < size; c5++) if (g[r5][c5]) darkCount++;
+          var pct = (darkCount * 100) / (size * size);
+          score += Math.floor(Math.abs(pct - 50) / 5) * 10;
+          return score;
+        }
+
+        var bestGrid = null;
+        var bestScore = Infinity;
+        for (var m = 0; m < 8; m++) {
+          var g = [];
+          for (var gr = 0; gr < size; gr++) {
+            var row = new Uint8Array(size);
+            for (var gc = 0; gc < size; gc++) {
+              row[gc] = func[gr][gc] ? base[gr][gc] : (maskFn[m](gr, gc) ? (base[gr][gc] ^ 1) : base[gr][gc]);
+            }
+            g.push(row);
+          }
+          applyFormat(g, m);
+          var sc = penalty(g);
+          if (sc < bestScore) {
+            bestScore = sc;
+            bestGrid = g;
+          }
+        }
+
+        var quiet = 4;
+        var total = size + quiet * 2;
+        var parts = [];
+        for (var sr = 0; sr < size; sr++) {
+          for (var sc2 = 0; sc2 < size; sc2++) {
+            if (bestGrid[sr][sc2]) {
+              parts.push("M" + (sc2 + quiet) + "," + (sr + quiet) + "h1v1h-1z");
+            }
+          }
+        }
+        var svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 " + total + " " + total + "' shape-rendering='crispEdges'>" +
+          "<rect width='" + total + "' height='" + total + "' fill='#ffffff'/>" +
+          "<path d='" + parts.join("") + "' fill='#0f172a'/></svg>";
+        return "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+      }
+
+      return encode;
+    })();
+
     function CloudTunnelModal(props) {
       var onClose = props.onClose;
       var [loading, setLoading] = React.useState(true);
@@ -19,6 +374,7 @@ window.__ModuleLoader__.load({
       var [saving, setSaving] = React.useState(false);
       var [showToken, setShowToken] = React.useState(false);
       var [rotating, setRotating] = React.useState(false);
+      var [showServerForm, setShowServerForm] = React.useState(false);
 
       function fetchStatus(forceSyncForm) {
         fetch("/api/cloud-tunnel/status")
@@ -127,10 +483,9 @@ window.__ModuleLoader__.load({
       var lanIp = lanIps[0];
       var localPort = form.localPort || 58000;
       var lanDirectEnabled = Boolean(form.lanDirectEnabled);
-      var lanUrl = lanDirectEnabled ? ("http://" + lanIp + ":" + localPort + "/") : "已关闭（仅监听 127.0.0.1）";
+      var lanUrl = "http://" + lanIp + ":" + localPort + "/";
       var wanUrl = form.publicUrl || "";
       var bridgeToken = (data && data.bridgeToken) ? data.bridgeToken : "";
-      var maskedToken = bridgeToken ? (bridgeToken.slice(0, 6) + "••••••••••••" + bridgeToken.slice(-4)) : "生成中...";
       var pairingCode = "";
       try {
         if (bridgeToken) {
@@ -146,9 +501,10 @@ window.__ModuleLoader__.load({
           pairingCode = "dsh-tunnel://cfg?d=" + b64;
         }
       } catch (_) {}
+      var qrDataUri = pairingCode ? encodeQrSvgDataUri(pairingCode) : "";
 
-      var statusColor = status === "connected" ? "#10b981" : status === "connecting" ? "#f59e0b" : status === "error" ? "#ef4444" : "#64748b";
-      var statusText = status === "connected" ? "隧道已连通" : status === "connecting" ? "正在连接..." : status === "error" ? "连接异常" : "未连接";
+      var statusColor = status === "connected" ? "#10b981" : status === "connecting" ? "#f59e0b" : status === "error" ? "#ef4444" : (lanDirectEnabled ? "#38bdf8" : "#64748b");
+      var statusText = status === "connected" ? "云端隧道已连通" : status === "connecting" ? "正在连接..." : status === "error" ? "连接异常" : (lanDirectEnabled ? "同 Wi-Fi 直连已就绪" : "未开启远程");
 
       return React.createElement("div", {
         style: {
@@ -198,7 +554,7 @@ window.__ModuleLoader__.load({
           }, [
             React.createElement("div", { key: "title-box", style: { display: "flex", alignItems: "center", gap: "10px" } }, [
               React.createElement("span", { key: "dot", style: { width: "10px", height: "10px", borderRadius: "50%", background: statusColor } }),
-              React.createElement("span", { key: "t", style: { fontSize: "16px", fontWeight: "600" } }, "云服务器远程穿透"),
+              React.createElement("span", { key: "t", style: { fontSize: "16px", fontWeight: "600" } }, "手机远程连接"),
               React.createElement("span", { key: "st", style: { fontSize: "12px", color: statusColor, background: "rgba(255,255,255,0.06)", padding: "2px 8px", borderRadius: "4px" } }, statusText)
             ]),
             React.createElement("button", {
@@ -211,7 +567,7 @@ window.__ModuleLoader__.load({
           // Body
           React.createElement("div", {
             key: "b",
-            style: { padding: "20px", overflowY: "auto", flex: 1, display: "flex", flexDirection: "column", gap: "16px" }
+            style: { padding: "18px 20px", overflowY: "auto", flex: 1, display: "flex", flexDirection: "column", gap: "14px" }
           }, [
             // Error Banner (if any and not connected)
             (lastError && status !== "connected") ? React.createElement("div", {
@@ -228,114 +584,97 @@ window.__ModuleLoader__.load({
               }
             }, "⚠ " + lastError) : null,
 
-            // Quick Access Cards
+            // Hero QR Pairing Card
             React.createElement("div", {
-              key: "links",
-              style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }
+              key: "qr-card",
+              style: {
+                display: "flex",
+                gap: "16px",
+                alignItems: "center",
+                background: "rgba(56, 189, 248, 0.07)",
+                border: "1px solid rgba(56, 189, 248, 0.25)",
+                borderRadius: "12px",
+                padding: "14px"
+              }
             }, [
-              // LAN card
-              React.createElement("div", {
-                key: "lan",
-                style: { background: "#1e293b", borderRadius: "10px", padding: "12px", border: "1px solid rgba(255,255,255,0.08)" }
+              qrDataUri ? React.createElement("div", {
+                key: "qr-wrap",
+                style: {
+                  background: "#ffffff",
+                  padding: "6px",
+                  borderRadius: "10px",
+                  flexShrink: 0,
+                  boxShadow: "0 4px 14px rgba(0,0,0,0.35)"
+                }
               }, [
-                React.createElement("div", { key: "lan-t", style: { fontSize: "12px", color: "#94a3b8", marginBottom: "4px" } }, "📶 局域网直连 (Wi-Fi)"),
-                React.createElement("div", { key: "lan-u", style: { fontSize: "13px", fontWeight: "500", wordBreak: "break-all", marginBottom: "8px", color: lanDirectEnabled ? "#f8fafc" : "#94a3b8" } }, lanUrl),
-                lanDirectEnabled ? React.createElement("button", {
-                  key: "lan-btn",
-                  onClick: () => copyText(lanUrl, "lan"),
-                  style: { background: "#334155", border: "none", borderRadius: "6px", color: "#f8fafc", fontSize: "11px", padding: "4px 8px", cursor: "pointer" }
-                }, copied === "lan" ? "✓ 已复制" : "复制地址") : React.createElement("span", {
-                  key: "lan-tip",
-                  style: { fontSize: "11px", color: "#34d399" }
-                }, "🔒 外部不可见 (推荐)")
-              ]),
-              // WAN card
+                React.createElement("img", {
+                  key: "qr-img",
+                  src: qrDataUri,
+                  alt: "手机扫码绑定二维码",
+                  style: { width: "148px", height: "148px", display: "block", imageRendering: "pixelated" }
+                })
+              ]) : null,
               React.createElement("div", {
-                key: "wan",
-                style: { background: "#1e293b", borderRadius: "10px", padding: "12px", border: "1px solid rgba(255,255,255,0.08)" }
+                key: "qr-info",
+                style: { flex: 1, display: "flex", flexDirection: "column", gap: "8px", minWidth: 0 }
               }, [
-                React.createElement("div", { key: "wan-t", style: { fontSize: "12px", color: "#94a3b8", marginBottom: "4px" } }, "☁️ 公网远程 (4G/5G)"),
-                React.createElement("div", { key: "wan-u", style: { fontSize: "13px", fontWeight: "500", wordBreak: "break-all", marginBottom: "8px" } }, wanUrl || "未配置公网地址"),
-                wanUrl ? React.createElement("button", {
-                  key: "wan-btn",
-                  onClick: () => copyText(wanUrl, "wan"),
-                  style: { background: "#334155", border: "none", borderRadius: "6px", color: "#f8fafc", fontSize: "11px", padding: "4px 8px", cursor: "pointer" }
-                }, copied === "wan" ? "✓ 已复制" : "复制地址") : null
+                React.createElement("div", { key: "qt1", style: { fontSize: "14px", fontWeight: "600", color: "#f8fafc" } }, "📱 手机扫码一键绑定"),
+                React.createElement("div", { key: "qt2", style: { fontSize: "12px", color: "#cbd5e1", lineHeight: "1.45" } },
+                  "打开手机「DSH 云端直连」App 点击扫码，自动填入所有连接地址与认证令牌，无需手动填写："),
+                React.createElement("div", { key: "qt3", style: { fontSize: "11px", color: "#94a3b8", lineHeight: "1.5" } }, [
+                  React.createElement("div", { key: "q-lan" }, "📶 同 Wi-Fi 直连：" + (lanDirectEnabled ? ("已包含 (" + lanIp + ":" + localPort + ")") : "未开启")),
+                  React.createElement("div", { key: "q-wan" }, "☁️ 云端中转：" + (wanUrl ? wanUrl : "未配置（外网 4G/5G 时才需要）"))
+                ]),
+                React.createElement("div", { key: "qr-btns", style: { display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "2px" } }, [
+                  pairingCode ? React.createElement("button", {
+                    key: "pbtn",
+                    onClick: () => copyText(pairingCode, "pair"),
+                    style: { background: "#0284c7", border: "none", borderRadius: "6px", color: "#fff", fontSize: "11px", fontWeight: "600", padding: "5px 10px", cursor: "pointer" }
+                  }, copied === "pair" ? "✓ 已复制配对码" : "复制配置码") : null,
+                  React.createElement("button", {
+                    key: "tk-eye",
+                    onClick: () => setShowToken(!showToken),
+                    style: { background: "#334155", border: "none", borderRadius: "6px", color: "#e2e8f0", fontSize: "11px", padding: "5px 10px", cursor: "pointer" }
+                  }, showToken ? "收起令牌" : "查看令牌"),
+                  React.createElement("button", {
+                    key: "tk-rot",
+                    onClick: handleRotateToken,
+                    disabled: rotating,
+                    style: { background: "rgba(239, 68, 68, 0.16)", border: "1px solid rgba(239, 68, 68, 0.35)", borderRadius: "6px", color: "#fca5a5", fontSize: "11px", padding: "5px 10px", cursor: "pointer" }
+                  }, rotating ? "重置中..." : "换新令牌")
+                ])
               ])
             ]),
 
-            // Mobile Pairing Code Bar
-            pairingCode ? React.createElement("div", {
-              key: "pair-bar",
-              style: {
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                gap: "10px",
-                background: "rgba(56, 189, 248, 0.08)",
-                border: "1px solid rgba(56, 189, 248, 0.25)",
-                padding: "10px 14px",
-                borderRadius: "10px"
-              }
+            showToken ? React.createElement("div", {
+              key: "tk-drawer",
+              style: { display: "flex", alignItems: "center", gap: "8px", background: "#1e293b", padding: "8px 12px", borderRadius: "8px" }
             }, [
-              React.createElement("div", { key: "pt", style: { fontSize: "12px", color: "#bae6fd", lineHeight: "1.4" } },
-                "📱 手机端 App 一键导入（已含安全 Token）：复制配置码并在手机 App「从剪贴板导入」粘贴"),
+              React.createElement("span", { key: "l", style: { fontSize: "11px", color: "#94a3b8", whiteSpace: "nowrap" } }, "当前令牌:"),
+              React.createElement("code", { key: "v", style: { flex: 1, fontSize: "11px", color: "#38bdf8", wordBreak: "break-all" } }, bridgeToken),
               React.createElement("button", {
-                key: "pbtn",
-                onClick: () => copyText(pairingCode, "pair"),
-                style: {
-                  background: "#0284c7",
-                  border: "none",
-                  borderRadius: "6px",
-                  color: "#fff",
-                  fontSize: "11px",
-                  fontWeight: "600",
-                  padding: "6px 10px",
-                  whiteSpace: "nowrap",
-                  cursor: "pointer"
-                }
-              }, copied === "pair" ? "✓ 已复制配对码" : "复制配置码")
+                key: "c",
+                onClick: () => copyText(bridgeToken, "token"),
+                style: { background: "#334155", border: "none", borderRadius: "6px", color: "#fff", fontSize: "11px", padding: "4px 8px", cursor: "pointer" }
+              }, copied === "token" ? "✓ 已复制" : "复制")
             ]) : null,
 
-            // Toggle Bar
+            // Two Connection Modes Card
             React.createElement("div", {
-              key: "tgl-bar",
-              style: { display: "flex", justifyContent: "space-between", alignItems: "center", background: "#1e293b", padding: "10px 14px", borderRadius: "8px" }
+              key: "modes-box",
+              style: { display: "flex", flexDirection: "column", gap: "10px", background: "#1e293b", padding: "12px 14px", borderRadius: "10px", border: "1px solid rgba(255,255,255,0.08)" }
             }, [
-              React.createElement("span", { key: "lb", style: { fontSize: "13px" } }, "穿透隧道开关"),
-              React.createElement("button", {
-                key: "tgl-btn",
-                onClick: handleToggle,
-                style: {
-                  background: form.enabled ? "#10b981" : "#475569",
-                  color: "#fff",
-                  border: "none",
-                  borderRadius: "20px",
-                  padding: "4px 14px",
-                  fontSize: "12px",
-                  fontWeight: "600",
-                  cursor: "pointer"
-                }
-              }, form.enabled ? "已开启" : "已关闭")
-            ]),
-
-            // Security & Bridge Access Control Card
-            React.createElement("div", {
-              key: "sec-box",
-              style: { display: "flex", flexDirection: "column", gap: "10px", background: "rgba(16, 185, 129, 0.06)", border: "1px solid rgba(16, 185, 129, 0.22)", padding: "12px 14px", borderRadius: "10px" }
-            }, [
-              React.createElement("div", { key: "sec-hdr", style: { fontSize: "13px", fontWeight: "600", color: "#6ee7b7" } }, "🛡️ 网桥安全加固"),
-              // LAN direct toggle
+              // Mode 1: Same Wi-Fi Direct
               React.createElement("div", {
-                key: "lan-tgl-row",
-                style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px" }
+                key: "m-lan",
+                style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px" }
               }, [
-                React.createElement("div", { key: "lt-txt" }, [
-                  React.createElement("div", { key: "lt-1", style: { fontSize: "12px", fontWeight: "500", color: "#f8fafc" } }, "允许同 Wi-Fi 局域网直连 (0.0.0.0)"),
-                  React.createElement("div", { key: "lt-2", style: { fontSize: "11px", color: "#94a3b8", marginTop: "2px" } },
+                React.createElement("div", { key: "ml-txt", style: { flex: 1 } }, [
+                  React.createElement("div", { key: "ml-1", style: { fontSize: "13px", fontWeight: "600", color: "#f8fafc" } }, "📶 方式一：同一 Wi-Fi 下令牌直连"),
+                  React.createElement("div", { key: "ml-2", style: { fontSize: "11px", color: "#94a3b8", marginTop: "2px" } },
                     lanDirectEnabled
-                      ? "已监听所有网卡，所有请求均强制校验 Bridge Token 与同源策略"
-                      : "仅监听 127.0.0.1（推荐：公共 Wi-Fi 下外部完全不可见）")
+                      ? ("已开启（" + lanUrl + "）— 同一 Wi-Fi 的手机扫上方二维码即可凭令牌秒连")
+                      : "已关闭 — 仅允许下方云服务器隧道访问，同一 Wi-Fi 下无法扫描发现本机")
                 ]),
                 React.createElement("button", {
                   key: "lan-tgl-btn",
@@ -345,54 +684,79 @@ window.__ModuleLoader__.load({
                     handleSave({ lanDirectEnabled: nextVal });
                   },
                   style: {
-                    background: lanDirectEnabled ? "#0284c7" : "#475569",
+                    background: lanDirectEnabled ? "#10b981" : "#475569",
                     color: "#fff",
                     border: "none",
                     borderRadius: "20px",
-                    padding: "4px 12px",
-                    fontSize: "11px",
+                    padding: "5px 14px",
+                    fontSize: "12px",
                     fontWeight: "600",
                     whiteSpace: "nowrap",
                     cursor: "pointer"
                   }
                 }, lanDirectEnabled ? "已开启" : "已关闭")
               ]),
-              // Bridge Token row
-              React.createElement("div", { key: "tk-row", style: { display: "flex", flexDirection: "column", gap: "6px", borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: "8px" } }, [
-                React.createElement("div", { key: "tk-lbl", style: { fontSize: "11px", color: "#cbd5e1" } },
-                  "网桥访问令牌 (Bridge Token) — 无论是局域网直连还是云端网页登录都必须凭此 Token 鉴权："),
-                React.createElement("div", { key: "tk-ctrl", style: { display: "flex", gap: "6px", alignItems: "center" } }, [
-                  React.createElement("code", {
-                    key: "tk-val",
-                    style: { flex: 1, background: "#020617", border: "1px solid #334155", borderRadius: "6px", padding: "6px 8px", fontSize: "11px", color: "#38bdf8", wordBreak: "break-all" }
-                  }, showToken ? bridgeToken : maskedToken),
-                  React.createElement("button", {
-                    key: "tk-eye",
-                    onClick: () => setShowToken(!showToken),
-                    style: { background: "#334155", border: "none", borderRadius: "6px", color: "#e2e8f0", fontSize: "11px", padding: "6px 8px", cursor: "pointer", whiteSpace: "nowrap" }
-                  }, showToken ? "隐藏" : "显示"),
-                  React.createElement("button", {
-                    key: "tk-copy",
-                    onClick: () => copyText(bridgeToken, "token"),
-                    disabled: !bridgeToken,
-                    style: { background: "#0284c7", border: "none", borderRadius: "6px", color: "#fff", fontSize: "11px", padding: "6px 8px", cursor: "pointer", whiteSpace: "nowrap" }
-                  }, copied === "token" ? "✓ 已复制" : "复制"),
-                  React.createElement("button", {
-                    key: "tk-rot",
-                    onClick: handleRotateToken,
-                    disabled: rotating,
-                    style: { background: "rgba(239, 68, 68, 0.2)", border: "1px solid rgba(239, 68, 68, 0.4)", borderRadius: "6px", color: "#fca5a5", fontSize: "11px", padding: "6px 8px", cursor: "pointer", whiteSpace: "nowrap" }
-                  }, rotating ? "重置中..." : "重置")
-                ])
+
+              // Mode 2: Cloud Server Relay
+              React.createElement("div", {
+                key: "m-wan",
+                style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px", borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: "10px" }
+              }, [
+                React.createElement("div", { key: "mw-txt", style: { flex: 1 } }, [
+                  React.createElement("div", { key: "mw-1", style: { fontSize: "13px", fontWeight: "600", color: "#f8fafc" } }, "☁️ 方式二：云服务器中转（外网 4G/5G）"),
+                  React.createElement("div", { key: "mw-2", style: { fontSize: "11px", color: "#94a3b8", marginTop: "2px" } },
+                    wanUrl
+                      ? ("公网地址: " + wanUrl + "（手机端需选定 .p12 证书连接）")
+                      : "未填写公网地址；外出通过 4G/5G 访问时请在下方配置服务器并开启")
+                ]),
+                React.createElement("button", {
+                  key: "tgl-btn",
+                  onClick: handleToggle,
+                  style: {
+                    background: form.enabled ? "#10b981" : "#475569",
+                    color: "#fff",
+                    border: "none",
+                    borderRadius: "20px",
+                    padding: "5px 14px",
+                    fontSize: "12px",
+                    fontWeight: "600",
+                    whiteSpace: "nowrap",
+                    cursor: "pointer"
+                  }
+                }, form.enabled ? "已开启" : "已关闭")
               ])
             ]),
 
-            // Form
-            React.createElement("div", {
-              key: "form",
-              style: { display: "flex", flexDirection: "column", gap: "10px", background: "rgba(255,255,255,0.03)", padding: "14px", borderRadius: "10px" }
+            // Collapsible Cloud Server Configuration Header
+            React.createElement("button", {
+              key: "srv-collapse-btn",
+              type: "button",
+              onClick: () => setShowServerForm(!showServerForm),
+              style: {
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                width: "100%",
+                background: "rgba(255,255,255,0.04)",
+                border: "1px solid rgba(255,255,255,0.1)",
+                borderRadius: "10px",
+                padding: "10px 14px",
+                color: "#cbd5e1",
+                fontSize: "12px",
+                cursor: "pointer"
+              }
             }, [
-              React.createElement("div", { key: "sec-t", style: { fontSize: "13px", fontWeight: "600", color: "#cbd5e1" } }, "⚙️ 通用服务器配置"),
+              React.createElement("span", { key: "sl", style: { fontWeight: "600" } },
+                "⚙️ 云服务器中转配置" + (form.serverHost ? ("（" + form.serverHost + "）") : "（仅外网 4G/5G 需要，同 Wi-Fi 可不填）")),
+              React.createElement("span", { key: "sr", style: { color: "#94a3b8" } }, showServerForm ? "收起 ▲" : "展开设置 ▼")
+            ]),
+
+            // Form
+            showServerForm ? React.createElement("div", {
+              key: "form",
+              style: { display: "flex", flexDirection: "column", gap: "10px", background: "rgba(255,255,255,0.03)", padding: "14px", borderRadius: "10px", border: "1px solid rgba(255,255,255,0.06)" }
+            }, [
+              React.createElement("div", { key: "sec-t", style: { fontSize: "12px", color: "#94a3b8" } }, "只在同 Wi-Fi 下使用可不填；需要外网 4G/5G 远程访问时，请填写云服务器信息并保存："),
 
               // Host & Port
               React.createElement("div", { key: "row1", style: { display: "grid", gridTemplateColumns: "2fr 1fr", gap: "8px" } }, [
@@ -463,7 +827,7 @@ window.__ModuleLoader__.load({
               // Local & Remote Ports
               React.createElement("div", { key: "ports-row", style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" } }, [
                 React.createElement("div", { key: "lp" }, [
-                  React.createElement("label", { style: { fontSize: "11px", color: "#94a3b8" } }, "本地网桥端口"),
+                  React.createElement("label", { style: { fontSize: "11px", color: "#94a3b8" } }, "本机接入端口 (默认 58000)"),
                   React.createElement("input", {
                     value: form.localPort !== undefined ? form.localPort : 58000,
                     onChange: e => setForm({ ...form, localPort: e.target.value }),
@@ -537,7 +901,7 @@ window.__ModuleLoader__.load({
                   }
                 }, showScript ? "收起脚本" : "📜 配置脚本")
               ])
-            ]),
+            ]) : null,
 
             // Server Script Drawer
             showScript ? React.createElement("div", {
