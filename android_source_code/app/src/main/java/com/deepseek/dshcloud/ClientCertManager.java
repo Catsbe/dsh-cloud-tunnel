@@ -28,6 +28,8 @@ import java.util.Collection;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLContext;
@@ -38,8 +40,8 @@ import javax.net.ssl.X509ExtendedKeyManager;
 import javax.net.ssl.X509TrustManager;
 
 public class ClientCertManager {
-    private static final String P12_FILENAME = "client_cert.p12";
-    private static final String SERVER_CA_FILENAME = "server_ca.crt";
+    private static final String LEGACY_P12_FILENAME = "client_cert.p12";
+    private static final String LEGACY_SERVER_CA_FILENAME = "server_ca.crt";
 
     public static class CertIdentity {
         public PrivateKey privateKey;
@@ -59,80 +61,145 @@ public class ClientCertManager {
         }
     }
 
-    private static volatile CertIdentity cachedIdentity;
-    private static volatile String lastLoadError = "";
+    private static final Map<String, CertIdentity> cachedIdentities = new ConcurrentHashMap<>();
+    private static final Map<String, String> lastLoadErrors = new ConcurrentHashMap<>();
 
-    public static CertIdentity getCachedIdentity() {
-        return cachedIdentity;
+    private static String safeId(String profileId) {
+        if (profileId == null || profileId.trim().isEmpty()) return "default";
+        return profileId.replaceAll("[^a-zA-Z0-9_-]", "_");
     }
 
-    public static String getLastLoadError() {
-        return lastLoadError;
+    private static File getP12File(Context ctx, String profileId) {
+        return new File(ctx.getFilesDir(), "client_cert_" + safeId(profileId) + ".p12");
     }
 
-    public static void clearCache() {
-        cachedIdentity = null;
-        lastLoadError = "";
+    private static File getServerCaFile(Context ctx, String profileId) {
+        return new File(ctx.getFilesDir(), "server_ca_" + safeId(profileId) + ".crt");
     }
 
-    public static boolean hasStoredP12(Context ctx) {
-        File f = new File(ctx.getFilesDir(), P12_FILENAME);
+    public static void migrateLegacyFilesToProfile(Context ctx, String profileId) {
+        String sid = safeId(profileId);
+        File oldP12 = new File(ctx.getFilesDir(), LEGACY_P12_FILENAME);
+        File newP12 = getP12File(ctx, sid);
+        if (oldP12.exists() && oldP12.length() > 0 && !newP12.exists()) {
+            oldP12.renameTo(newP12);
+        }
+        File oldCa = new File(ctx.getFilesDir(), LEGACY_SERVER_CA_FILENAME);
+        File newCa = getServerCaFile(ctx, sid);
+        if (oldCa.exists() && oldCa.length() > 0 && !newCa.exists()) {
+            oldCa.renameTo(newCa);
+        }
+    }
+
+    public static void deleteProfileFiles(Context ctx, String profileId) {
+        String sid = safeId(profileId);
+        File f1 = getP12File(ctx, sid);
+        if (f1.exists()) f1.delete();
+        File f2 = getServerCaFile(ctx, sid);
+        if (f2.exists()) f2.delete();
+        cachedIdentities.remove(sid);
+        lastLoadErrors.remove(sid);
+    }
+
+    public static CertIdentity getCachedIdentity(String profileId) {
+        return cachedIdentities.get(safeId(profileId));
+    }
+
+    public static String getLastLoadError(String profileId) {
+        String err = lastLoadErrors.get(safeId(profileId));
+        return err == null ? "" : err;
+    }
+
+    public static void clearCache(String profileId) {
+        String sid = safeId(profileId);
+        cachedIdentities.remove(sid);
+        lastLoadErrors.remove(sid);
+    }
+
+    public static boolean hasStoredP12(Context ctx, String profileId) {
+        File f = getP12File(ctx, profileId);
         return f.exists() && f.length() > 0;
     }
 
-    public static boolean hasStoredServerCa(Context ctx) {
-        File f = new File(ctx.getFilesDir(), SERVER_CA_FILENAME);
+    public static boolean hasStoredServerCa(Context ctx, String profileId) {
+        File f = getServerCaFile(ctx, profileId);
         return f.exists() && f.length() > 0;
     }
 
-    public static void deleteStoredP12(Context ctx) {
-        File f = new File(ctx.getFilesDir(), P12_FILENAME);
+    public static void deleteStoredP12(Context ctx, String profileId) {
+        String sid = safeId(profileId);
+        File f = getP12File(ctx, sid);
         if (f.exists()) f.delete();
-        cachedIdentity = null;
-        lastLoadError = "";
+        cachedIdentities.remove(sid);
+        lastLoadErrors.remove(sid);
     }
 
-    public static void deleteStoredServerCa(Context ctx) {
-        File f = new File(ctx.getFilesDir(), SERVER_CA_FILENAME);
+    public static void deleteStoredServerCa(Context ctx, String profileId) {
+        File f = getServerCaFile(ctx, profileId);
         if (f.exists()) f.delete();
+    }
+
+    public static CertIdentity copyP12FromProfile(Context ctx, String fromProfileId, String toProfileId, String password) throws Exception {
+        File src = getP12File(ctx, fromProfileId);
+        if (!src.exists() || src.length() == 0) {
+            throw new IllegalArgumentException("来源电脑尚未导入 .p12 文件");
+        }
+        byte[] data;
+        try (FileInputStream fis = new FileInputStream(src)) {
+            data = readAllBytes(fis, 5 * 1024 * 1024);
+        }
+        CertIdentity id;
+        try {
+            id = parseP12Bytes(data, password);
+        } catch (Exception e) {
+            throw new IllegalArgumentException(translateP12Error(e));
+        }
+        String targetSid = safeId(toProfileId);
+        File dst = getP12File(ctx, targetSid);
+        try (FileOutputStream fos = new FileOutputStream(dst)) {
+            fos.write(data);
+            fos.flush();
+        }
+        cachedIdentities.put(targetSid, id);
+        lastLoadErrors.put(targetSid, "");
+        return id;
     }
 
     public static CertIdentity loadActiveIdentity(Context ctx, TunnelConfig cfg) {
         if (cfg == null) {
-            cachedIdentity = null;
-            lastLoadError = "";
             return null;
         }
+        String sid = safeId(cfg.id);
         if (TunnelConfig.CERT_P12.equals(cfg.certMode)) {
-            File f = new File(ctx.getFilesDir(), P12_FILENAME);
+            File f = getP12File(ctx, sid);
             if (!f.exists() || f.length() == 0) {
-                cachedIdentity = null;
-                lastLoadError = "未找到已导入的 .p12 证书文件";
+                cachedIdentities.remove(sid);
+                lastLoadErrors.put(sid, "未找到已导入的 .p12 证书文件");
                 return null;
             }
             try (FileInputStream fis = new FileInputStream(f)) {
                 byte[] data = readAllBytes(fis, 5 * 1024 * 1024);
                 CertIdentity id = parseP12Bytes(data, cfg.p12Password);
-                cachedIdentity = id;
-                lastLoadError = "";
+                cachedIdentities.put(sid, id);
+                lastLoadErrors.put(sid, "");
                 return id;
             } catch (Exception e) {
-                cachedIdentity = null;
-                lastLoadError = translateP12Error(e);
+                cachedIdentities.remove(sid);
+                lastLoadErrors.put(sid, translateP12Error(e));
                 return null;
             }
         } else if (TunnelConfig.CERT_SYSTEM.equals(cfg.certMode)) {
             if (cfg.systemCertAlias == null || cfg.systemCertAlias.trim().isEmpty()) {
-                cachedIdentity = null;
-                lastLoadError = "尚未选择系统证书别名";
+                cachedIdentities.remove(sid);
+                lastLoadErrors.put(sid, "尚未选择系统证书别名");
                 return null;
             }
             try {
                 PrivateKey pk = KeyChain.getPrivateKey(ctx, cfg.systemCertAlias);
                 X509Certificate[] chain = KeyChain.getCertificateChain(ctx, cfg.systemCertAlias);
                 if (pk == null || chain == null || chain.length == 0) {
-                    cachedIdentity = null;
-                    lastLoadError = "系统证书不可用或未授权，请重新选择";
+                    cachedIdentities.remove(sid);
+                    lastLoadErrors.put(sid, "系统证书不可用或未授权，请重新选择");
                     return null;
                 }
                 CertIdentity id = new CertIdentity();
@@ -141,22 +208,22 @@ public class ClientCertManager {
                 id.subjectCn = extractCommonName(chain[0]);
                 id.validUntil = formatDate(chain[0]);
                 id.modeLabel = "系统证书 [" + cfg.systemCertAlias + "]";
-                cachedIdentity = id;
-                lastLoadError = "";
+                cachedIdentities.put(sid, id);
+                lastLoadErrors.put(sid, "");
                 return id;
             } catch (Exception e) {
-                cachedIdentity = null;
-                lastLoadError = "读取系统证书失败: " + e.getMessage();
+                cachedIdentities.remove(sid);
+                lastLoadErrors.put(sid, "读取系统证书失败: " + e.getMessage());
                 return null;
             }
         } else {
-            cachedIdentity = null;
-            lastLoadError = "";
+            cachedIdentities.remove(sid);
+            lastLoadErrors.put(sid, "");
             return null;
         }
     }
 
-    public static CertIdentity importP12FromUri(Context ctx, Uri uri, String password) throws Exception {
+    public static CertIdentity importP12FromUri(Context ctx, String profileId, Uri uri, String password) throws Exception {
         byte[] data;
         try (InputStream is = ctx.getContentResolver().openInputStream(uri)) {
             if (is == null) throw new IllegalArgumentException("无法打开所选文件");
@@ -168,17 +235,18 @@ public class ClientCertManager {
         } catch (Exception e) {
             throw new IllegalArgumentException(translateP12Error(e));
         }
-        File outFile = new File(ctx.getFilesDir(), P12_FILENAME);
+        String sid = safeId(profileId);
+        File outFile = getP12File(ctx, sid);
         try (FileOutputStream fos = new FileOutputStream(outFile)) {
             fos.write(data);
             fos.flush();
         }
-        cachedIdentity = id;
-        lastLoadError = "";
+        cachedIdentities.put(sid, id);
+        lastLoadErrors.put(sid, "");
         return id;
     }
 
-    public static int importServerCaFromUri(Context ctx, Uri uri) throws Exception {
+    public static int importServerCaFromUri(Context ctx, String profileId, Uri uri) throws Exception {
         byte[] data;
         try (InputStream is = ctx.getContentResolver().openInputStream(uri)) {
             if (is == null) throw new IllegalArgumentException("无法打开证书文件");
@@ -189,7 +257,7 @@ public class ClientCertManager {
         if (certs == null || certs.isEmpty()) {
             throw new IllegalArgumentException("未识别到有效的 X.509 服务端 CA 证书 (.crt/.pem)");
         }
-        File outFile = new File(ctx.getFilesDir(), SERVER_CA_FILENAME);
+        File outFile = getServerCaFile(ctx, profileId);
         try (FileOutputStream fos = new FileOutputStream(outFile)) {
             fos.write(data);
             fos.flush();
@@ -244,7 +312,7 @@ public class ClientCertManager {
     }
 
     public static SSLContext buildMtlsSslContext(Context ctx, TunnelConfig cfg) throws Exception {
-        CertIdentity id = cachedIdentity;
+        CertIdentity id = cfg != null ? cachedIdentities.get(safeId(cfg.id)) : null;
         if (id == null && cfg != null && !TunnelConfig.CERT_NONE.equals(cfg.certMode)) {
             id = loadActiveIdentity(ctx, cfg);
         }
@@ -301,7 +369,7 @@ public class ClientCertManager {
         final X509TrustManager sysTm = findX509TrustManager(sysTmf.getTrustManagers());
 
         X509TrustManager customCaTm = null;
-        File caFile = new File(ctx.getFilesDir(), SERVER_CA_FILENAME);
+        File caFile = getServerCaFile(ctx, cfg != null ? cfg.id : "default");
         if (caFile.exists() && caFile.length() > 0) {
             try (FileInputStream fis = new FileInputStream(caFile)) {
                 CertificateFactory cf = CertificateFactory.getInstance("X.509");

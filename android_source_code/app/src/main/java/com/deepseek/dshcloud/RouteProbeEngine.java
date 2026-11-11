@@ -54,14 +54,36 @@ public class RouteProbeEngine {
 
     public static class ProbeResult {
         public boolean ok;
+        public boolean authRequired;
         public boolean isLan;
         public int httpCode;
         public long latencyMs;
         public String url;
         public String hostName = "";
         public String publicUrl = "";
+        public String matchedProfileId = "";
+        public String matchedProfileName = "";
         public List<String> lanIps = new ArrayList<>();
         public String errorDetail = "";
+    }
+
+    public static class MachineProbeStatus {
+        public String profileId = "";
+        public boolean probing = false;
+        public ProbeResult lanResult;
+        public ProbeResult wanResult;
+
+        public boolean isLanOk() {
+            return lanResult != null && lanResult.ok;
+        }
+
+        public boolean isWanOk() {
+            return wanResult != null && wanResult.ok;
+        }
+
+        public boolean anyReachable() {
+            return isLanOk() || isWanOk();
+        }
     }
 
     public static class DualProbeDecision {
@@ -146,6 +168,9 @@ public class RouteProbeEngine {
             conn.setUseCaches(false);
             conn.setInstanceFollowRedirects(false);
             conn.setRequestProperty("Accept", "application/json");
+            if (cfg != null && cfg.bridgeToken != null && !cfg.bridgeToken.trim().isEmpty()) {
+                conn.setRequestProperty("X-DSH-Bridge-Token", cfg.bridgeToken.trim());
+            }
 
             if (conn instanceof HttpsURLConnection) {
                 HttpsURLConnection https = (HttpsURLConnection) conn;
@@ -196,6 +221,21 @@ public class RouteProbeEngine {
             res.ok = false;
             if (code == 400) {
                 res.errorDetail = "mTLS 客户端证书缺失或不被服务器信任 (HTTP 400)";
+            } else if (code == 401) {
+                try {
+                    JSONObject json = new JSONObject(body);
+                    if ("dsh-cloud-tunnel".equals(json.optString("plugin", "")) && json.optBoolean("authRequired", false)) {
+                        res.authRequired = true;
+                        res.errorDetail = (cfg == null || cfg.bridgeToken == null || cfg.bridgeToken.trim().isEmpty())
+                                ? "缺少 Bridge Token，请导入配对码或手动输入令牌"
+                                : "Bridge Token 无效或已在电脑端重置 (HTTP 401)";
+                        return res;
+                    }
+                } catch (Exception ignored) {
+                }
+                res.errorDetail = "网桥鉴权失败 (HTTP 401)";
+            } else if (code == 403) {
+                res.errorDetail = "网桥安全策略拒绝访问 (HTTP 403)";
             } else if (code == 502 || code == 503 || code == 504) {
                 res.errorDetail = "云服务器 mTLS 已连通，但电脑端 SSH 隧道未在线 (HTTP " + code + ")";
             } else if (code >= 300 && code < 400) {
@@ -214,6 +254,64 @@ public class RouteProbeEngine {
                 try { conn.disconnect(); } catch (Exception ignored) {}
             }
         }
+    }
+
+    public static List<String> authenticateBridgeSession(Context ctx, TunnelConfig cfg, String baseUrl, boolean isLan) {
+        List<String> cookies = new ArrayList<>();
+        if (baseUrl == null || baseUrl.trim().isEmpty()) return cookies;
+        if (cfg == null || cfg.bridgeToken == null || cfg.bridgeToken.trim().isEmpty()) return cookies;
+
+        HttpURLConnection conn = null;
+        try {
+            URL u = new URL(baseUrl + "/_dsh_bridge_auth");
+            conn = (HttpURLConnection) (isLan ? u.openConnection(Proxy.NO_PROXY) : u.openConnection());
+            conn.setRequestMethod("POST");
+            conn.setConnectTimeout(isLan ? 900 : 3500);
+            conn.setReadTimeout(isLan ? 900 : 3500);
+            conn.setUseCaches(false);
+            conn.setInstanceFollowRedirects(false);
+            conn.setDoOutput(true);
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("Accept", "application/json");
+            conn.setRequestProperty("X-DSH-Bridge-Token", cfg.bridgeToken.trim());
+
+            if (conn instanceof HttpsURLConnection) {
+                HttpsURLConnection https = (HttpsURLConnection) conn;
+                SSLContext sslCtx = ClientCertManager.buildMtlsSslContext(ctx, cfg);
+                https.setSSLSocketFactory(sslCtx.getSocketFactory());
+                if (cfg.trustedServerCertSha256 != null && !cfg.trustedServerCertSha256.trim().isEmpty()) {
+                    final String pinned = cfg.trustedServerCertSha256.trim();
+                    final HostnameVerifier defVerifier = HttpsURLConnection.getDefaultHostnameVerifier();
+                    https.setHostnameVerifier((hostname, session) -> {
+                        if (defVerifier.verify(hostname, session)) return true;
+                        return matchesPinnedPeer(session, pinned);
+                    });
+                }
+            }
+
+            try (java.io.OutputStream os = conn.getOutputStream()) {
+                os.write("{}".getBytes(StandardCharsets.UTF_8));
+                os.flush();
+            }
+
+            int code = conn.getResponseCode();
+            if (code >= 200 && code < 300) {
+                java.util.Map<String, List<String>> hdrs = conn.getHeaderFields();
+                if (hdrs != null) {
+                    for (java.util.Map.Entry<String, List<String>> entry : hdrs.entrySet()) {
+                        if (entry.getKey() != null && "set-cookie".equalsIgnoreCase(entry.getKey()) && entry.getValue() != null) {
+                            cookies.addAll(entry.getValue());
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (conn != null) {
+                try { conn.disconnect(); } catch (Exception ignored) {}
+            }
+        }
+        return cookies;
     }
 
     private static boolean matchesPinnedPeer(SSLSession session, String pinnedSha256) {
@@ -454,7 +552,88 @@ public class RouteProbeEngine {
         return firstErr.get() != null ? firstErr.get() : probeSingle(ctx, cfg, lanUrls.get(0), true, timeoutMs, timeoutMs);
     }
 
+    public static MachineProbeStatus probeProfileAllTracks(Context ctx, TunnelConfig cfg) {
+        MachineProbeStatus st = new MachineProbeStatus();
+        st.profileId = cfg != null ? cfg.ensureId() : "";
+        if (cfg == null) return st;
+
+        if (!TunnelConfig.CERT_NONE.equals(cfg.certMode)) {
+            ClientCertManager.loadActiveIdentity(ctx, cfg);
+        }
+
+        NetworkState netState = inspectNetwork(ctx);
+        List<String> lanUrls = cfg.getNormalizedLanUrls();
+        String wanUrl = cfg.getNormalizedWanUrl();
+        String mode = cfg.routeMode == null ? TunnelConfig.ROUTE_AUTO : cfg.routeMode;
+
+        if (TunnelConfig.ROUTE_LAN_ONLY.equals(mode)) {
+            st.lanResult = probeLanListBest(ctx, cfg, lanUrls, 800);
+            ProbeResult skippedWan = new ProbeResult();
+            skippedWan.isLan = false;
+            skippedWan.url = wanUrl;
+            skippedWan.errorDetail = "仅局域网模式";
+            st.wanResult = skippedWan;
+            return st;
+        }
+
+        if (TunnelConfig.ROUTE_WAN_ONLY.equals(mode)) {
+            ProbeResult skippedLan = new ProbeResult();
+            skippedLan.isLan = true;
+            skippedLan.url = lanUrls.isEmpty() ? "" : lanUrls.get(0);
+            skippedLan.errorDetail = "仅公网模式";
+            st.lanResult = skippedLan;
+            st.wanResult = probeSingle(ctx, cfg, wanUrl, false, 3200, 3200);
+            return st;
+        }
+
+        boolean canTryLan = !lanUrls.isEmpty() && (netState.hasWifiOrEthernet || netState.hasVpn || !netState.hasCellular);
+        ExecutorService pairPool = Executors.newFixedThreadPool(2);
+        Future<ProbeResult> lanF = pairPool.submit(() -> {
+            if (lanUrls.isEmpty()) {
+                ProbeResult empty = new ProbeResult();
+                empty.isLan = true;
+                empty.errorDetail = "未配置局域网地址";
+                return empty;
+            }
+            if (!canTryLan) {
+                ProbeResult skipped = new ProbeResult();
+                skipped.isLan = true;
+                skipped.url = lanUrls.get(0);
+                skipped.errorDetail = "当前非 Wi-Fi 网络";
+                return skipped;
+            }
+            return probeLanListBest(ctx, cfg, lanUrls, 750);
+        });
+        Future<ProbeResult> wanF = pairPool.submit(() -> probeSingle(ctx, cfg, wanUrl, false, 3200, 3200));
+
+        try {
+            st.lanResult = lanF.get(2500, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            ProbeResult err = new ProbeResult();
+            err.isLan = true;
+            err.errorDetail = "局域网探测超时";
+            st.lanResult = err;
+        }
+        try {
+            st.wanResult = wanF.get(3800, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            ProbeResult err = new ProbeResult();
+            err.isLan = false;
+            err.url = wanUrl;
+            err.errorDetail = "公网探测超时";
+            st.wanResult = err;
+        }
+        pairPool.shutdownNow();
+        return st;
+    }
+
     public static void scanLocalSubnetForDsh(Context ctx, TunnelConfig cfg, int port, ScanCallback callback) {
+        List<TunnelConfig> single = new ArrayList<>();
+        if (cfg != null) single.add(cfg);
+        scanLocalSubnetWithProfiles(ctx, single, port, callback);
+    }
+
+    public static void scanLocalSubnetWithProfiles(Context ctx, List<TunnelConfig> boundProfiles, int port, ScanCallback callback) {
         new Thread(() -> {
             NetworkState net = inspectNetwork(ctx);
             if (!net.hasWifiOrEthernet || net.localWifiIpv4.isEmpty()) {
@@ -477,8 +656,21 @@ public class RouteProbeEngine {
                     try {
                         if (!targetIp.equals(net.localWifiIpv4)) {
                             String url = "http://" + targetIp + ":" + port;
-                            ProbeResult pr = probeSingle(ctx, cfg, url, true, 260, 320);
-                            if (pr.ok) {
+                            ProbeResult pr = probeSingle(ctx, null, url, true, 260, 320);
+                            if (pr.authRequired && boundProfiles != null && !boundProfiles.isEmpty()) {
+                                for (TunnelConfig p : boundProfiles) {
+                                    if (p != null && p.bridgeToken != null && !p.bridgeToken.trim().isEmpty()) {
+                                        ProbeResult authPr = probeSingle(ctx, p, url, true, 450, 450);
+                                        if (authPr.ok) {
+                                            authPr.matchedProfileId = p.id != null ? p.id : "";
+                                            authPr.matchedProfileName = p.profileName != null ? p.profileName : "";
+                                            pr = authPr;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (pr.ok || pr.authRequired) {
                                 synchronized (found) {
                                     found.add(pr);
                                 }
@@ -492,7 +684,7 @@ public class RouteProbeEngine {
             }
 
             try {
-                latch.await(8, TimeUnit.SECONDS);
+                latch.await(9, TimeUnit.SECONDS);
             } catch (InterruptedException ignored) {
             }
             pool.shutdownNow();

@@ -17,6 +17,8 @@ window.__ModuleLoader__.load({
       var [showScript, setShowScript] = React.useState(false);
       var [serverScript, setServerScript] = React.useState("");
       var [saving, setSaving] = React.useState(false);
+      var [showToken, setShowToken] = React.useState(false);
+      var [rotating, setRotating] = React.useState(false);
 
       function fetchStatus(forceSyncForm) {
         fetch("/api/cloud-tunnel/status")
@@ -38,12 +40,14 @@ window.__ModuleLoader__.load({
         return () => clearInterval(timer);
       }, []);
 
-      function handleSave() {
+      function handleSave(overrideFields) {
         setSaving(true);
-        var payload = Object.assign({}, form, {
-          serverPort: Number(form.serverPort) || 22,
-          remotePort: Number(form.remotePort) || 58001,
-          localPort: Number(form.localPort) || 58000
+        var merged = Object.assign({}, form, overrideFields || {});
+        var payload = Object.assign({}, merged, {
+          serverPort: Number(merged.serverPort) || 22,
+          remotePort: Number(merged.remotePort) || 58001,
+          localPort: Number(merged.localPort) || 58000,
+          lanDirectEnabled: Boolean(merged.lanDirectEnabled)
         });
         fetch("/api/cloud-tunnel/config", {
           method: "POST",
@@ -57,6 +61,23 @@ window.__ModuleLoader__.load({
             setTimeout(() => fetchStatus(false), 1200);
           })
           .catch(() => setSaving(false));
+      }
+
+      function handleRotateToken() {
+        if (!window.confirm("确定要重置 Bridge Token 吗？重置后所有已配对手机和浏览器会话都会立即失效，需要重新导入配对码或输入新 Token。")) {
+          return;
+        }
+        setRotating(true);
+        fetch("/api/cloud-tunnel/rotate-token", { method: "POST" })
+          .then(r => r.json())
+          .then(d => {
+            setRotating(false);
+            if (d && d.bridgeToken) {
+              setData(prev => prev ? Object.assign({}, prev, { bridgeToken: d.bridgeToken }) : prev);
+            }
+            fetchStatus(false);
+          })
+          .catch(() => setRotating(false));
       }
 
       function handleReconnect() {
@@ -105,19 +126,25 @@ window.__ModuleLoader__.load({
       var lanIps = (data && data.lanIps && data.lanIps.length) ? data.lanIps : ["127.0.0.1"];
       var lanIp = lanIps[0];
       var localPort = form.localPort || 58000;
-      var lanUrl = "http://" + lanIp + ":" + localPort + "/";
+      var lanDirectEnabled = Boolean(form.lanDirectEnabled);
+      var lanUrl = lanDirectEnabled ? ("http://" + lanIp + ":" + localPort + "/") : "已关闭（仅监听 127.0.0.1）";
       var wanUrl = form.publicUrl || "";
+      var bridgeToken = (data && data.bridgeToken) ? data.bridgeToken : "";
+      var maskedToken = bridgeToken ? (bridgeToken.slice(0, 6) + "••••••••••••" + bridgeToken.slice(-4)) : "生成中...";
       var pairingCode = "";
       try {
-        var cfgObj = {
-          name: (data && data.hostName) ? data.hostName : "我的 DSH 电脑",
-          localPort: Number(localPort) || 58000,
-          lanUrls: lanIps.map(ip => "http://" + ip + ":" + localPort),
-          wanUrl: wanUrl
-        };
-        var b64 = btoa(unescape(encodeURIComponent(JSON.stringify(cfgObj))))
-          .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-        pairingCode = "dsh-tunnel://cfg?d=" + b64;
+        if (bridgeToken) {
+          var cfgObj = {
+            name: (data && data.hostName) ? data.hostName : "我的 DSH 电脑",
+            localPort: Number(localPort) || 58000,
+            lanUrls: lanDirectEnabled ? lanIps.map(ip => "http://" + ip + ":" + localPort) : [],
+            wanUrl: wanUrl,
+            token: bridgeToken
+          };
+          var b64 = btoa(unescape(encodeURIComponent(JSON.stringify(cfgObj))))
+            .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+          pairingCode = "dsh-tunnel://cfg?d=" + b64;
+        }
       } catch (_) {}
 
       var statusColor = status === "connected" ? "#10b981" : status === "connecting" ? "#f59e0b" : status === "error" ? "#ef4444" : "#64748b";
@@ -212,12 +239,15 @@ window.__ModuleLoader__.load({
                 style: { background: "#1e293b", borderRadius: "10px", padding: "12px", border: "1px solid rgba(255,255,255,0.08)" }
               }, [
                 React.createElement("div", { key: "lan-t", style: { fontSize: "12px", color: "#94a3b8", marginBottom: "4px" } }, "📶 局域网直连 (Wi-Fi)"),
-                React.createElement("div", { key: "lan-u", style: { fontSize: "13px", fontWeight: "500", wordBreak: "break-all", marginBottom: "8px" } }, lanUrl),
-                React.createElement("button", {
+                React.createElement("div", { key: "lan-u", style: { fontSize: "13px", fontWeight: "500", wordBreak: "break-all", marginBottom: "8px", color: lanDirectEnabled ? "#f8fafc" : "#94a3b8" } }, lanUrl),
+                lanDirectEnabled ? React.createElement("button", {
                   key: "lan-btn",
                   onClick: () => copyText(lanUrl, "lan"),
                   style: { background: "#334155", border: "none", borderRadius: "6px", color: "#f8fafc", fontSize: "11px", padding: "4px 8px", cursor: "pointer" }
-                }, copied === "lan" ? "✓ 已复制" : "复制地址")
+                }, copied === "lan" ? "✓ 已复制" : "复制地址") : React.createElement("span", {
+                  key: "lan-tip",
+                  style: { fontSize: "11px", color: "#34d399" }
+                }, "🔒 外部不可见 (推荐)")
               ]),
               // WAN card
               React.createElement("div", {
@@ -249,7 +279,7 @@ window.__ModuleLoader__.load({
               }
             }, [
               React.createElement("div", { key: "pt", style: { fontSize: "12px", color: "#bae6fd", lineHeight: "1.4" } },
-                "📱 手机端 App 一键导入：复制配置码并在手机 App「从剪贴板导入」粘贴（或在同 Wi-Fi 下自动扫描发现）"),
+                "📱 手机端 App 一键导入（已含安全 Token）：复制配置码并在手机 App「从剪贴板导入」粘贴"),
               React.createElement("button", {
                 key: "pbtn",
                 onClick: () => copyText(pairingCode, "pair"),
@@ -287,6 +317,74 @@ window.__ModuleLoader__.load({
                   cursor: "pointer"
                 }
               }, form.enabled ? "已开启" : "已关闭")
+            ]),
+
+            // Security & Bridge Access Control Card
+            React.createElement("div", {
+              key: "sec-box",
+              style: { display: "flex", flexDirection: "column", gap: "10px", background: "rgba(16, 185, 129, 0.06)", border: "1px solid rgba(16, 185, 129, 0.22)", padding: "12px 14px", borderRadius: "10px" }
+            }, [
+              React.createElement("div", { key: "sec-hdr", style: { fontSize: "13px", fontWeight: "600", color: "#6ee7b7" } }, "🛡️ 网桥安全加固"),
+              // LAN direct toggle
+              React.createElement("div", {
+                key: "lan-tgl-row",
+                style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px" }
+              }, [
+                React.createElement("div", { key: "lt-txt" }, [
+                  React.createElement("div", { key: "lt-1", style: { fontSize: "12px", fontWeight: "500", color: "#f8fafc" } }, "允许同 Wi-Fi 局域网直连 (0.0.0.0)"),
+                  React.createElement("div", { key: "lt-2", style: { fontSize: "11px", color: "#94a3b8", marginTop: "2px" } },
+                    lanDirectEnabled
+                      ? "已监听所有网卡，所有请求均强制校验 Bridge Token 与同源策略"
+                      : "仅监听 127.0.0.1（推荐：公共 Wi-Fi 下外部完全不可见）")
+                ]),
+                React.createElement("button", {
+                  key: "lan-tgl-btn",
+                  onClick: () => {
+                    var nextVal = !lanDirectEnabled;
+                    setForm(Object.assign({}, form, { lanDirectEnabled: nextVal }));
+                    handleSave({ lanDirectEnabled: nextVal });
+                  },
+                  style: {
+                    background: lanDirectEnabled ? "#0284c7" : "#475569",
+                    color: "#fff",
+                    border: "none",
+                    borderRadius: "20px",
+                    padding: "4px 12px",
+                    fontSize: "11px",
+                    fontWeight: "600",
+                    whiteSpace: "nowrap",
+                    cursor: "pointer"
+                  }
+                }, lanDirectEnabled ? "已开启" : "已关闭")
+              ]),
+              // Bridge Token row
+              React.createElement("div", { key: "tk-row", style: { display: "flex", flexDirection: "column", gap: "6px", borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: "8px" } }, [
+                React.createElement("div", { key: "tk-lbl", style: { fontSize: "11px", color: "#cbd5e1" } },
+                  "网桥访问令牌 (Bridge Token) — 无论是局域网直连还是云端网页登录都必须凭此 Token 鉴权："),
+                React.createElement("div", { key: "tk-ctrl", style: { display: "flex", gap: "6px", alignItems: "center" } }, [
+                  React.createElement("code", {
+                    key: "tk-val",
+                    style: { flex: 1, background: "#020617", border: "1px solid #334155", borderRadius: "6px", padding: "6px 8px", fontSize: "11px", color: "#38bdf8", wordBreak: "break-all" }
+                  }, showToken ? bridgeToken : maskedToken),
+                  React.createElement("button", {
+                    key: "tk-eye",
+                    onClick: () => setShowToken(!showToken),
+                    style: { background: "#334155", border: "none", borderRadius: "6px", color: "#e2e8f0", fontSize: "11px", padding: "6px 8px", cursor: "pointer", whiteSpace: "nowrap" }
+                  }, showToken ? "隐藏" : "显示"),
+                  React.createElement("button", {
+                    key: "tk-copy",
+                    onClick: () => copyText(bridgeToken, "token"),
+                    disabled: !bridgeToken,
+                    style: { background: "#0284c7", border: "none", borderRadius: "6px", color: "#fff", fontSize: "11px", padding: "6px 8px", cursor: "pointer", whiteSpace: "nowrap" }
+                  }, copied === "token" ? "✓ 已复制" : "复制"),
+                  React.createElement("button", {
+                    key: "tk-rot",
+                    onClick: handleRotateToken,
+                    disabled: rotating,
+                    style: { background: "rgba(239, 68, 68, 0.2)", border: "1px solid rgba(239, 68, 68, 0.4)", borderRadius: "6px", color: "#fca5a5", fontSize: "11px", padding: "6px 8px", cursor: "pointer", whiteSpace: "nowrap" }
+                  }, rotating ? "重置中..." : "重置")
+                ])
+              ])
             ]),
 
             // Form
@@ -357,13 +455,15 @@ window.__ModuleLoader__.load({
                   value: form.password || "",
                   onChange: e => setForm({ ...form, password: e.target.value }),
                   style: { width: "100%", background: "#1e293b", border: "1px solid #334155", color: "#fff", borderRadius: "6px", padding: "6px 8px", fontSize: "12px", marginTop: "4px" }
-                })
+                }),
+                React.createElement("div", { key: "pw-warn", style: { fontSize: "11px", color: "#fbbf24", marginTop: "4px", lineHeight: "1.4" } },
+                  "⚠️ 建议日常一律改用 SSH 私钥登录（虽然密码已不再写入临时 askpass 脚本，但仍会保存在本机配置文件中）。")
               ]),
 
               // Local & Remote Ports
               React.createElement("div", { key: "ports-row", style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" } }, [
                 React.createElement("div", { key: "lp" }, [
-                  React.createElement("label", { style: { fontSize: "11px", color: "#94a3b8" } }, "本地网桥端口 (局域网)"),
+                  React.createElement("label", { style: { fontSize: "11px", color: "#94a3b8" } }, "本地网桥端口"),
                   React.createElement("input", {
                     value: form.localPort !== undefined ? form.localPort : 58000,
                     onChange: e => setForm({ ...form, localPort: e.target.value }),
@@ -395,7 +495,7 @@ window.__ModuleLoader__.load({
               React.createElement("div", { key: "acts", style: { display: "flex", gap: "8px", marginTop: "8px" } }, [
                 React.createElement("button", {
                   key: "save",
-                  onClick: handleSave,
+                  onClick: () => handleSave(),
                   disabled: saving,
                   style: {
                     flex: 1,

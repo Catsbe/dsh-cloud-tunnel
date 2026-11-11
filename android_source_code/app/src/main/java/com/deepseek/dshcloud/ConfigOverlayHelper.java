@@ -27,15 +27,18 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.util.ArrayList;
 import java.util.List;
 
 public class ConfigOverlayHelper {
 
     public interface HostActions {
-        void onPickP12File();
-        void onPickServerCaFile();
+        void onPickP12File(String targetProfileId);
+        void onPickServerCaFile(String targetProfileId);
         void onRequestSystemCert(KeyChainAliasCallback cb);
+        void onConfigSavedToList(TunnelConfig updatedConfig);
         void onConfigSavedAndConnect(TunnelConfig updatedConfig);
+        void onProfileDeleted(String profileId);
         void onCloseRequested();
     }
 
@@ -48,11 +51,17 @@ public class ConfigOverlayHelper {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private TunnelConfig draftConfig;
+    private boolean isNewProfile = true;
+    private List<TunnelConfig> otherProfiles = new ArrayList<>();
     private View rootOverlay;
+    private TextView tvHeaderTitle;
     private Button btnClose;
+    private Button btnReuseP12;
+    private Button btnDeleteProfile;
     private EditText etName;
     private EditText etLanUrls;
     private EditText etWanUrl;
+    private EditText etBridgeToken;
     private EditText etP12Pass;
     private RadioGroup rgRouteMode;
     private RadioButton rbAuto;
@@ -66,6 +75,7 @@ public class ConfigOverlayHelper {
     private Button btnTestBoth;
     private Button btnScanLan;
     private boolean passVisible = false;
+    private boolean tokenVisible = false;
 
     public ConfigOverlayHelper(Context ctx, HostActions host) {
         this.ctx = ctx;
@@ -94,17 +104,16 @@ public class ConfigOverlayHelper {
         header.setGravity(Gravity.CENTER_VERTICAL);
         header.setPadding(0, 0, 0, dp(12));
 
-        TextView title = new TextView(ctx);
-        title.setText("⚙️ DSH 远控 · 双轨与 mTLS 设置");
-        title.setTextColor(Color.parseColor("#F8FAFC"));
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
+        tvHeaderTitle = new TextView(ctx);
+        tvHeaderTitle.setText("⚙️ 电脑通道与 mTLS 设置");
+        tvHeaderTitle.setTextColor(Color.parseColor("#F8FAFC"));
+        tvHeaderTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        tvHeaderTitle.setTypeface(Typeface.DEFAULT_BOLD);
         LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        header.addView(title, titleLp);
+        header.addView(tvHeaderTitle, titleLp);
 
-        btnClose = makeSmallBtn("返回", "#334155", "#E2E8F0");
+        btnClose = makeSmallBtn("返回列表", "#334155", "#E2E8F0");
         btnClose.setOnClickListener(v -> host.onCloseRequested());
-        btnClose.setVisibility(draftConfig.hasAnyEndpoint() ? View.VISIBLE : View.GONE);
         header.addView(btnClose);
         container.addView(header);
 
@@ -156,6 +165,32 @@ public class ConfigOverlayHelper {
         netCard.addView(makeLabel("公网 mTLS 转发地址 (外出 4G/5G 走云服务器)"));
         etWanUrl = makeInput("例如：https://dsh.example.com:8443", false);
         netCard.addView(etWanUrl);
+
+        netCard.addView(makeLabel("网桥访问令牌 (Bridge Token，安全鉴权必填)"));
+        LinearLayout tokenRow = new LinearLayout(ctx);
+        tokenRow.setOrientation(LinearLayout.HORIZONTAL);
+        tokenRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        etBridgeToken = makeInput("粘贴 PC 端配置码会自动填入，或手动粘贴 Token", false);
+        etBridgeToken.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        LinearLayout.LayoutParams tkLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        tkLp.rightMargin = dp(8);
+        tokenRow.addView(etBridgeToken, tkLp);
+
+        Button btnTokenEye = makeSmallBtn("显示", "#334155", "#CBD5E1");
+        btnTokenEye.setOnClickListener(v -> {
+            tokenVisible = !tokenVisible;
+            if (tokenVisible) {
+                etBridgeToken.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+                btnTokenEye.setText("隐藏");
+            } else {
+                etBridgeToken.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+                btnTokenEye.setText("显示");
+            }
+            etBridgeToken.setSelection(etBridgeToken.getText().length());
+        });
+        tokenRow.addView(btnTokenEye);
+        netCard.addView(tokenRow);
 
         netCard.addView(makeLabel("默认切换策略"));
         rgRouteMode = new RadioGroup(ctx);
@@ -239,7 +274,7 @@ public class ConfigOverlayHelper {
         cb1.rightMargin = dp(8);
         btnPickP12.setOnClickListener(v -> {
             draftConfig.p12Password = etP12Pass.getText().toString();
-            host.onPickP12File();
+            host.onPickP12File(draftConfig.ensureId());
         });
         certBtns.addView(btnPickP12, cb1);
 
@@ -257,6 +292,12 @@ public class ConfigOverlayHelper {
         certBtns.addView(btnPickSys, cb2);
         certCard.addView(certBtns);
 
+        btnReuseP12 = makeSmallBtn("📋 复用其他已绑定电脑的 .p12 证书", "#1E293B", "#34D399");
+        btnReuseP12.setOnClickListener(v -> showReuseP12Dialog());
+        LinearLayout.LayoutParams reuseLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        reuseLp.topMargin = dp(8);
+        certCard.addView(btnReuseP12, reuseLp);
+
         // Secondary Cert actions (Unlock / Clear / Custom Server CA)
         LinearLayout certExtra = new LinearLayout(ctx);
         certExtra.setOrientation(LinearLayout.HORIZONTAL);
@@ -264,7 +305,8 @@ public class ConfigOverlayHelper {
 
         Button btnReunlock = makeSmallBtn("用当前密码重载 .p12", "#1E293B", "#38BDF8");
         btnReunlock.setOnClickListener(v -> {
-            if (!ClientCertManager.hasStoredP12(ctx)) {
+            String pid = draftConfig.ensureId();
+            if (!ClientCertManager.hasStoredP12(ctx, pid)) {
                 toast("尚未导入过 .p12 文件");
                 return;
             }
@@ -277,7 +319,7 @@ public class ConfigOverlayHelper {
                     if (id != null) {
                         toast("证书解锁成功: " + id.subjectCn);
                     } else {
-                        toast(ClientCertManager.getLastLoadError());
+                        toast(ClientCertManager.getLastLoadError(pid));
                     }
                 });
             }).start();
@@ -317,28 +359,70 @@ public class ConfigOverlayHelper {
         testCard.addView(tvTestResult);
         container.addView(testCard, makeCardLp());
 
-        // Primary Save & Connect Button
-        Button btnSave = makeActionBtn("💾 保存配置并立即连接", "#10B981", "#022C22");
-        btnSave.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
-        btnSave.setTypeface(Typeface.DEFAULT_BOLD);
-        LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48));
-        saveLp.topMargin = dp(6);
-        btnSave.setOnClickListener(v -> saveAndSubmit());
-        container.addView(btnSave, saveLp);
+        // Primary Save Buttons Row
+        LinearLayout saveRow = new LinearLayout(ctx);
+        saveRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams saveRowLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        saveRowLp.topMargin = dp(6);
+
+        Button btnSaveList = makeActionBtn("💾 保存到设备列表", "#10B981", "#022C22");
+        btnSaveList.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        btnSaveList.setTypeface(Typeface.DEFAULT_BOLD);
+        btnSaveList.setOnClickListener(v -> saveAndReturnToList());
+        LinearLayout.LayoutParams slLp = new LinearLayout.LayoutParams(0, dp(48), 1f);
+        slLp.rightMargin = dp(8);
+        saveRow.addView(btnSaveList, slLp);
+
+        Button btnSaveConnect = makeActionBtn("⚡ 保存并连接", "#2563EB", "#FFFFFF");
+        btnSaveConnect.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        btnSaveConnect.setTypeface(Typeface.DEFAULT_BOLD);
+        btnSaveConnect.setOnClickListener(v -> saveAndSubmit());
+        LinearLayout.LayoutParams scLp = new LinearLayout.LayoutParams(0, dp(48), 1f);
+        saveRow.addView(btnSaveConnect, scLp);
+
+        container.addView(saveRow, saveRowLp);
+
+        btnDeleteProfile = makeActionBtn("🗑️ 删除此电脑配置", "#7F1D1D", "#FCA5A5");
+        btnDeleteProfile.setOnClickListener(v -> confirmDeleteProfile());
+        LinearLayout.LayoutParams delLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42));
+        delLp.topMargin = dp(10);
+        container.addView(btnDeleteProfile, delLp);
 
         scroll.addView(container);
         backdrop.addView(scroll);
         this.rootOverlay = backdrop;
 
-        bindFromDraft(currentCfg);
+        bindFromDraft(currentCfg, true, null);
         return backdrop;
     }
 
-    public void bindFromDraft(TunnelConfig cfg) {
+    public void bindFromDraft(TunnelConfig cfg, boolean isNew, List<TunnelConfig> existingProfiles) {
+        this.isNewProfile = isNew;
         this.draftConfig = copyConfig(cfg);
+        this.draftConfig.ensureId();
+        this.otherProfiles = new ArrayList<>();
+        if (existingProfiles != null) {
+            for (TunnelConfig p : existingProfiles) {
+                if (p != null && !this.draftConfig.id.equals(p.id) && ClientCertManager.hasStoredP12(ctx, p.id)) {
+                    this.otherProfiles.add(p);
+                }
+            }
+        }
+        if (tvHeaderTitle != null) {
+            tvHeaderTitle.setText(isNew ? "➕ 绑定新电脑" : "⚙️ 编辑电脑配置");
+        }
+        if (btnReuseP12 != null) {
+            btnReuseP12.setVisibility(this.otherProfiles.isEmpty() ? View.GONE : View.VISIBLE);
+        }
+        if (btnDeleteProfile != null) {
+            btnDeleteProfile.setVisibility(isNew ? View.GONE : View.VISIBLE);
+        }
         etName.setText(draftConfig.profileName);
         etLanUrls.setText(draftConfig.lanUrlsRaw);
         etWanUrl.setText(draftConfig.wanUrl);
+        if (etBridgeToken != null) {
+            etBridgeToken.setText(draftConfig.bridgeToken);
+        }
         etP12Pass.setText(draftConfig.p12Password);
 
         if (TunnelConfig.ROUTE_LAN_ONLY.equals(draftConfig.routeMode)) {
@@ -349,8 +433,13 @@ public class ConfigOverlayHelper {
             rbAuto.setChecked(true);
         }
         swAutoUpgrade.setChecked(draftConfig.autoUpgradeToLan);
-        btnClose.setVisibility(draftConfig.hasAnyEndpoint() ? View.VISIBLE : View.GONE);
+        if (tvTestResult != null) tvTestResult.setVisibility(View.GONE);
+        if (tvScanStatus != null) tvScanStatus.setVisibility(View.GONE);
         refreshCertStatusUi();
+    }
+
+    public String getDraftProfileId() {
+        return draftConfig != null ? draftConfig.ensureId() : "default";
     }
 
     public String getDraftP12Password() {
@@ -373,15 +462,29 @@ public class ConfigOverlayHelper {
 
     public void applyParsedPairing(TunnelConfig.PairingParseResult res) {
         if (res.name != null && !res.name.isEmpty()) etName.setText(res.name);
-        if (res.lanUrlsJoined != null && !res.lanUrlsJoined.isEmpty()) etLanUrls.setText(res.lanUrlsJoined);
+        if (res.lanUrlsProvided) {
+            etLanUrls.setText(res.lanUrlsJoined == null ? "" : res.lanUrlsJoined);
+        } else if (res.lanUrlsJoined != null && !res.lanUrlsJoined.isEmpty()) {
+            etLanUrls.setText(res.lanUrlsJoined);
+        }
         if (res.wanUrl != null && !res.wanUrl.isEmpty()) etWanUrl.setText(res.wanUrl);
+        if (res.bridgeToken != null && !res.bridgeToken.isEmpty() && etBridgeToken != null) {
+            etBridgeToken.setText(res.bridgeToken);
+        }
+        if (res.localPort > 0 && draftConfig != null) {
+            draftConfig.defaultLocalPort = res.localPort;
+        }
         toast("已导入配对配置: " + res.name);
     }
 
     public void refreshCertStatusUi() {
         if (tvCertStatus == null) return;
-        ClientCertManager.CertIdentity id = ClientCertManager.getCachedIdentity();
-        String err = ClientCertManager.getLastLoadError();
+        String pid = getDraftProfileId();
+        ClientCertManager.CertIdentity id = ClientCertManager.getCachedIdentity(pid);
+        if (id == null && draftConfig != null && !TunnelConfig.CERT_NONE.equals(draftConfig.certMode)) {
+            id = ClientCertManager.loadActiveIdentity(ctx, draftConfig);
+        }
+        String err = ClientCertManager.getLastLoadError(pid);
         if (id != null && id.isValid()) {
             tvCertStatus.setText("✅ " + id.getSummaryText());
             tvCertStatus.setTextColor(Color.parseColor("#34D399"));
@@ -394,7 +497,7 @@ public class ConfigOverlayHelper {
         }
 
         if (tvCaStatus != null) {
-            boolean hasCa = ClientCertManager.hasStoredServerCa(ctx);
+            boolean hasCa = ClientCertManager.hasStoredServerCa(ctx, pid);
             boolean hasPin = draftConfig.trustedServerCertSha256 != null && !draftConfig.trustedServerCertSha256.isEmpty();
             if (hasCa || hasPin) {
                 tvCaStatus.setVisibility(View.VISIBLE);
@@ -407,16 +510,61 @@ public class ConfigOverlayHelper {
         }
     }
 
+    private void showReuseP12Dialog() {
+        if (otherProfiles == null || otherProfiles.isEmpty()) {
+            toast("没有可复用的已导入 .p12 证书");
+            return;
+        }
+        String[] labels = new String[otherProfiles.size()];
+        for (int i = 0; i < otherProfiles.size(); i++) {
+            TunnelConfig p = otherProfiles.get(i);
+            labels[i] = p.profileName + (p.wanUrl != null && !p.wanUrl.isEmpty() ? (" (" + p.wanUrl + ")") : "");
+        }
+        new AlertDialog.Builder(ctx)
+                .setTitle("选择要复用的 .p12 证书来源")
+                .setItems(labels, (d, which) -> {
+                    TunnelConfig src = otherProfiles.get(which);
+                    String targetPid = getDraftProfileId();
+                    new Thread(() -> {
+                        try {
+                            ClientCertManager.CertIdentity id = ClientCertManager.copyP12FromProfile(ctx, src.id, targetPid, src.p12Password);
+                            draftConfig.certMode = TunnelConfig.CERT_P12;
+                            draftConfig.p12Password = src.p12Password == null ? "" : src.p12Password;
+                            mainHandler.post(() -> {
+                                if (etP12Pass != null) etP12Pass.setText(draftConfig.p12Password);
+                                refreshCertStatusUi();
+                                toast("已复用证书: " + id.subjectCn);
+                            });
+                        } catch (Exception e) {
+                            mainHandler.post(() -> toast("复用证书失败: " + e.getMessage()));
+                        }
+                    }).start();
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void confirmDeleteProfile() {
+        if (draftConfig == null || isNewProfile) return;
+        new AlertDialog.Builder(ctx)
+                .setTitle("删除电脑配置")
+                .setMessage("确定删除「" + etName.getText().toString().trim() + "」及其关联的证书配置吗？")
+                .setPositiveButton("确定删除", (d, w) -> host.onProfileDeleted(draftConfig.ensureId()))
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
     private void showAdvancedCaDialog() {
-        boolean hasCa = ClientCertManager.hasStoredServerCa(ctx);
+        String pid = getDraftProfileId();
+        boolean hasCa = ClientCertManager.hasStoredServerCa(ctx, pid);
         boolean hasPin = draftConfig.trustedServerCertSha256 != null && !draftConfig.trustedServerCertSha256.isEmpty();
         AlertDialog.Builder b = new AlertDialog.Builder(ctx);
         b.setTitle("自定义服务端证书 (可选)");
         b.setMessage("若你的云服务器使用了正式域名证书（如 Let's Encrypt / 商业 CA），无需任何额外配置。\n\n仅当你使用纯 IP 或自签名服务端证书时，可在此导入服务端 CA (.crt/.pem)。");
-        b.setPositiveButton("导入服务端 CA (.crt)", (d, w) -> host.onPickServerCaFile());
+        b.setPositiveButton("导入服务端 CA (.crt)", (d, w) -> host.onPickServerCaFile(pid));
         if (hasCa || hasPin) {
             b.setNeutralButton("清除自定义信任", (d, w) -> {
-                ClientCertManager.deleteStoredServerCa(ctx);
+                ClientCertManager.deleteStoredServerCa(ctx, pid);
                 draftConfig.trustedServerCertSha256 = "";
                 refreshCertStatusUi();
                 toast("已清除自定义服务端证书信任");
@@ -480,13 +628,20 @@ public class ConfigOverlayHelper {
                     }
                     tvScanStatus.setTextColor(Color.parseColor("#34D399"));
                     if (allFound.size() == 1) {
-                        applyDiscoveredHost(allFound.get(0));
-                        tvScanStatus.setText("✅ 已自动填入: " + (allFound.get(0).hostName.isEmpty() ? allFound.get(0).url : allFound.get(0).hostName));
+                        RouteProbeEngine.ProbeResult item = allFound.get(0);
+                        applyDiscoveredHost(item);
+                        if (item.authRequired) {
+                            tvScanStatus.setTextColor(Color.parseColor("#FCD34D"));
+                            tvScanStatus.setText("🔐 已发现 DSH 网桥 (" + item.url + ")，请填入 PC 端 Bridge Token 或粘贴配对码");
+                        } else {
+                            tvScanStatus.setText("✅ 已自动填入: " + (item.hostName.isEmpty() ? item.url : item.hostName));
+                        }
                     } else {
                         String[] labels = new String[allFound.size()];
                         for (int i = 0; i < allFound.size(); i++) {
                             RouteProbeEngine.ProbeResult item = allFound.get(i);
-                            labels[i] = (item.hostName.isEmpty() ? "DSH 主机" : item.hostName) + " — " + item.url + " (" + item.latencyMs + "ms)";
+                            String title = item.hostName.isEmpty() ? (item.authRequired ? "DSH 网桥 (需 Token)" : "DSH 主机") : item.hostName;
+                            labels[i] = title + " — " + item.url + " (" + item.latencyMs + "ms)";
                         }
                         new AlertDialog.Builder(ctx)
                                 .setTitle("选择发现的 DSH 电脑")
@@ -572,6 +727,16 @@ public class ConfigOverlayHelper {
         }, "dsh-dual-test").start();
     }
 
+    private void saveAndReturnToList() {
+        TunnelConfig next = collectDraftFromFields();
+        if (!next.hasAnyEndpoint()) {
+            toast("请至少配置局域网地址或公网地址");
+            return;
+        }
+        next.save(ctx);
+        host.onConfigSavedToList(next);
+    }
+
     private void saveAndSubmit() {
         TunnelConfig next = collectDraftFromFields();
         if (!next.hasAnyEndpoint()) {
@@ -588,6 +753,7 @@ public class ConfigOverlayHelper {
         if (cfg.profileName.isEmpty()) cfg.profileName = "我的 DSH 电脑";
         cfg.lanUrlsRaw = etLanUrls.getText().toString().trim();
         cfg.wanUrl = TunnelConfig.normalizeUrl(etWanUrl.getText().toString(), "https", -1);
+        cfg.bridgeToken = etBridgeToken != null ? etBridgeToken.getText().toString().trim() : "";
         cfg.p12Password = etP12Pass.getText().toString();
         if (rbLanOnly.isChecked()) {
             cfg.routeMode = TunnelConfig.ROUTE_LAN_ONLY;
@@ -603,10 +769,12 @@ public class ConfigOverlayHelper {
     private static TunnelConfig copyConfig(TunnelConfig src) {
         TunnelConfig c = new TunnelConfig();
         if (src == null) return c;
+        c.id = src.ensureId();
         c.profileName = src.profileName;
         c.lanUrlsRaw = src.lanUrlsRaw;
         c.defaultLocalPort = src.defaultLocalPort;
         c.wanUrl = src.wanUrl;
+        c.bridgeToken = src.bridgeToken == null ? "" : src.bridgeToken;
         c.certMode = src.certMode;
         c.p12Password = src.p12Password == null ? "" : src.p12Password;
         c.systemCertAlias = src.systemCertAlias;

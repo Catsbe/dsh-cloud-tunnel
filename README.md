@@ -15,12 +15,14 @@
 
 1. **通用云端支持**：任意 Linux 服务器（Ubuntu / Debian / Alibaba Cloud Linux 等）均可部署。
 2. **双重 SSH 认证**：支持 **私钥文件**（如 `~/.ssh/id_rsa`）或 **账号密码** 登录。
-3. **零信任 mTLS 双向认证**：公网端口仅允许持有对应 `.p12` 客户端证书的设备完成 TLS 握手，防止端口扫描和未授权访问。
-4. **动态端口透明桥接**：自动追踪 DSH 每次启动绑定的随机本地端口，固定暴露到本地网桥端口（默认 `58000`），并自动注入 DSH 会话签名 Cookie 与同源请求头。
+3. **零信任双层鉴权**：
+   - **公网侧**：Nginx mTLS 双向证书校验，仅允许持有对应 `.p12` 客户端证书的设备完成 TLS 握手；
+   - **网桥侧**：默认仅监听 `127.0.0.1`（外部不可见）；即使手动开启「同 Wi-Fi 局域网直连」，所有 HTTP / WebSocket 请求也必须通过强随机 `Bridge Token`（及 `HttpOnly; SameSite=Lax` 会话 Cookie）鉴权，并严格校验 `Host`、`Origin`、`Sec-Fetch-Site`，禁用通配 CORS 与 Private Network Access。
+4. **动态端口透明桥接**：自动追踪 DSH 每次启动绑定的随机本地端口，桥接到本地网桥端口（默认 `58000`），仅在网桥鉴权与同源校验全部通过后才注入 DSH 会话签名 Cookie。
 5. **双轨秒切架构**：
-   - **同一 Wi-Fi 下**：手机端毫秒级探测本地网桥 `/_dsh_ping`，优先走 `http://<内网IP>:<localPort>` 直连 PC，零云端延迟、不走公网流量；
+   - **同一 Wi-Fi 下**（需在面板开启局域网直连并完成配对码/Token 导入）：手机端毫秒级探测本地网桥 `/_dsh_ping`，优先走 `http://<内网IP>:<localPort>` 直连 PC，零云端延迟、不走公网流量；
    - **外出 4G/5G**：自动切换 `https://<域名>:<公网端口>` 走云服务器 mTLS 隧道，断线重连后保留当前 WebUI 路径。
-6. **无感生命周期守护**：随 DSH 启动/关闭自动拉起或清理 SSH 隧道进程，断网唤醒后自动重连。
+6. **无感生命周期守护**：随 DSH 启动/关闭自动拉起或清理 SSH 隧道进程，断网唤醒后自动重连；密码认证不再向临时 `askpass` 脚本写入明文密码（仍建议优先使用 SSH 私钥登录）。
 
 ---
 
@@ -55,7 +57,9 @@ dsh plugin add github:Catsbe/dsh-cloud-tunnel
   "remotePort": 58001,
   "localPort": 58000,
   "publicUrl": "https://dsh.example.com:8443",
-  "autoStart": true
+  "autoStart": true,
+  "lanDirectEnabled": false,
+  "bridgeToken": "自动生成的 256-bit 随机令牌"
 }
 ```
 
