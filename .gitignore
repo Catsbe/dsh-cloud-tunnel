@@ -1,0 +1,31 @@
+# Keystores, certificates, and credentials (NEVER commit)
+*.jks
+*.keystore
+*.bks
+*.p12
+*.pfx
+*.pem
+*.crt
+*.cer
+*.key
+*.csr
+*.srl
+signing.properties
+local.properties
+cloud-tunnel-config.json
+askpass_*
+*.pid
+
+# Build outputs & caches
+*.apk
+*.aab
+*.idsig
+build/
+*-build/
+build-out/
+.gradle/
+.idea/
+*.iml
+node_modules/
+.DS_Store
+Thumbs.db

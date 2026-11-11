@@ -1,0 +1,6 @@
+# 复制为 signing.properties 后按需填写你自己的发布签名配置（切勿将真实密码或 .jks 提交到 Git）
+# 支持环境变量：DSH_KEYSTORE_PATH / DSH_KEYSTORE_PASS / DSH_KEY_ALIAS
+keystorePath=C:\\path\\to\\your-release.jks
+keystorePass=your-keystore-password
+keyAlias=your-key-alias
+keyPass=your-key-password
