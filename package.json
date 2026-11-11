@@ -1,6 +1,6 @@
 {
   "name": "dsh-cloud-tunnel",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "通用云服务器 SSH 穿透 + mTLS 局域网/公网双轨访问插件",
   "type": "module",
   "main": "index.js",
@@ -9,13 +9,31 @@
     "./client": "./client.js",
     "./package.json": "./package.json"
   },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
   "keywords": [
     "dsh-plugin",
     "remote",
     "cloud-tunnel",
     "ssh-tunnel",
-    "web-ui"
+    "web-ui",
+    "mtls"
   ],
+  "author": "Catsbe",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Catsbe/dsh-cloud-tunnel.git"
+  },
+  "homepage": "https://github.com/Catsbe/dsh-cloud-tunnel#readme",
+  "bugs": {
+    "url": "https://github.com/Catsbe/dsh-cloud-tunnel/issues"
+  },
   "dsh": {
     "displayName": "云服务器远程穿透",
     "description": "通过云服务器（支持密钥或密码）与 mTLS 安全转发 DSH 到手机",

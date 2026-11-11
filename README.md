@@ -27,6 +27,17 @@
 ## 🖥️ PC 端插件安装与配置
 
 ### 1. 安装插件到 DSH
+
+**方式 A：从 GitHub 直接安装（推荐）**
+
+在命令行运行（或在 DSH 设置 → 插件管理中从 GitHub 安装）：
+
+```sh
+dsh plugin add github:Catsbe/dsh-cloud-tunnel
+```
+
+**方式 B：本地开发调试安装**
+
 将仓库根目录下的插件文件复制（或软链接）到 DSH 插件目录（如 `~/.dsh/custom-plugins/dsh-cloud-tunnel`），并在当前 profile 中启用 `dsh-cloud-tunnel`。
 
 ### 2. 配置文件示例
