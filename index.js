@@ -1340,15 +1340,42 @@ export function apply(ctx) {
           res.writeHead(405).end();
           return;
         }
-        config.enabled = !config.enabled;
-        saveConfig(config);
-        if (config.enabled) {
-          startSsh();
-        } else {
-          stopSsh(true);
-        }
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ enabled: config.enabled, status: sshStatus }));
+        let body = "";
+        let tooLarge = false;
+        req.on("data", (chunk) => {
+          body += chunk;
+          if (body.length > 4096) {
+            tooLarge = true;
+            req.destroy();
+          }
+        });
+        req.on("end", async () => {
+          if (tooLarge) {
+            if (!res.headersSent) res.writeHead(413).end();
+            return;
+          }
+          try {
+            const updated = JSON.parse(body || "{}");
+            if (typeof updated.enabled !== "boolean") {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "enabled must be a boolean" }));
+              return;
+            }
+            // Execute the target shown to the user instead of blindly flipping a stale config value.
+            config.enabled = updated.enabled;
+            saveConfig(config);
+            if (config.enabled) {
+              await startSsh();
+            } else {
+              await stopSsh(true);
+            }
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ enabled: config.enabled, status: sshStatus }));
+          } catch (e) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: e.message }));
+          }
+        });
       }
     });
 

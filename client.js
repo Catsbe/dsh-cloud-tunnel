@@ -374,20 +374,30 @@ window.__ModuleLoader__.load({
       var [saving, setSaving] = React.useState(false);
       var [showToken, setShowToken] = React.useState(false);
       var [rotating, setRotating] = React.useState(false);
+      var [toggling, setToggling] = React.useState(false);
+      var [requestError, setRequestError] = React.useState("");
       var [showServerForm, setShowServerForm] = React.useState(false);
 
       function fetchStatus(forceSyncForm) {
-        fetch("/api/cloud-tunnel/status")
-          .then(r => r.json())
+        return fetch("/api/cloud-tunnel/status")
+          .then(r => {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+          })
           .then(d => {
             setData(d);
+            setRequestError("");
             if (!initializedRef.current || forceSyncForm) {
               setForm(Object.assign({}, d.config || {}, { password: "" }));
               initializedRef.current = true;
             }
             setLoading(false);
           })
-          .catch(() => setLoading(false));
+          .catch(() => {
+            setData(prev => Object.assign({}, prev || {}, { status: "unknown" }));
+            setRequestError("无法获取隧道实时状态，请检查本地服务连接");
+            setLoading(false);
+          });
       }
 
       React.useEffect(() => {
@@ -450,12 +460,27 @@ window.__ModuleLoader__.load({
       }
 
       function handleToggle() {
-        fetch("/api/cloud-tunnel/toggle", { method: "POST" })
-          .then(r => r.json())
+        if (toggling) return;
+        var currentStatus = data && data.status;
+        if (["connected", "connecting", "disconnected", "error"].indexOf(currentStatus) < 0) return;
+        var nextEnabled = currentStatus !== "connected" && currentStatus !== "connecting";
+        setToggling(true);
+        setRequestError("");
+        fetch("/api/cloud-tunnel/toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: nextEnabled })
+        })
+          .then(r => {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+          })
           .then(d => {
             setForm(prev => Object.assign({}, prev, { enabled: Boolean(d && d.enabled) }));
-            fetchStatus(false);
-          });
+            return fetchStatus(false);
+          })
+          .catch(err => setRequestError("切换隧道失败：" + (err.message || "网络错误")))
+          .finally(() => setToggling(false));
       }
 
       function copyText(text, label) {
@@ -477,12 +502,14 @@ window.__ModuleLoader__.load({
           });
       }
 
-      var status = data ? data.status : "connecting";
-      var lastError = data && data.lastError ? data.lastError : "";
+      var status = data && data.status ? data.status : "unknown";
+      var lastError = requestError || (data && data.lastError ? data.lastError : "");
       var lanIps = (data && data.lanIps && data.lanIps.length) ? data.lanIps : ["127.0.0.1"];
       var lanIp = lanIps[0];
       var localPort = form.localPort || 58000;
       var lanDirectEnabled = Boolean(form.lanDirectEnabled);
+      var cloudTunnelButtonText = toggling ? "处理中..." : status === "connecting" ? "连接中..." : status === "connected" ? "已开启" : status === "unknown" ? "状态未知" : "已关闭";
+      var cloudTunnelButtonColor = status === "connected" ? "#10b981" : status === "connecting" ? "#f59e0b" : status === "error" ? "#ef4444" : "#475569";
       var lanUrl = "http://" + lanIp + ":" + localPort + "/";
       var wanUrl = form.publicUrl || "";
       var bridgeToken = (data && data.bridgeToken) ? data.bridgeToken : "";
@@ -503,8 +530,8 @@ window.__ModuleLoader__.load({
       } catch (_) {}
       var qrDataUri = pairingCode ? encodeQrSvgDataUri(pairingCode) : "";
 
-      var statusColor = status === "connected" ? "#10b981" : status === "connecting" ? "#f59e0b" : status === "error" ? "#ef4444" : (lanDirectEnabled ? "#38bdf8" : "#64748b");
-      var statusText = status === "connected" ? "云端隧道已连通" : status === "connecting" ? "正在连接..." : status === "error" ? "连接异常" : (lanDirectEnabled ? "同 Wi-Fi 直连已就绪" : "未开启远程");
+      var statusColor = status === "connected" ? "#10b981" : status === "connecting" ? "#f59e0b" : status === "error" ? "#ef4444" : status === "unknown" ? "#64748b" : (lanDirectEnabled ? "#38bdf8" : "#64748b");
+      var statusText = status === "connected" ? "云端隧道已连通" : status === "connecting" ? "正在连接..." : status === "error" ? "连接异常" : status === "unknown" ? "状态未知" : (lanDirectEnabled ? "同 Wi-Fi 直连已就绪" : "未开启远程");
 
       return React.createElement("div", {
         style: {
@@ -570,7 +597,7 @@ window.__ModuleLoader__.load({
             style: { padding: "18px 20px", overflowY: "auto", flex: 1, display: "flex", flexDirection: "column", gap: "14px" }
           }, [
             // Error Banner (if any and not connected)
-            (lastError && status !== "connected") ? React.createElement("div", {
+            (requestError || (lastError && status !== "connected")) ? React.createElement("div", {
               key: "err-box",
               style: {
                 background: "rgba(239, 68, 68, 0.14)",
@@ -712,8 +739,9 @@ window.__ModuleLoader__.load({
                 React.createElement("button", {
                   key: "tgl-btn",
                   onClick: handleToggle,
+                  disabled: toggling || status === "unknown",
                   style: {
-                    background: form.enabled ? "#10b981" : "#475569",
+                    background: cloudTunnelButtonColor,
                     color: "#fff",
                     border: "none",
                     borderRadius: "20px",
@@ -721,9 +749,10 @@ window.__ModuleLoader__.load({
                     fontSize: "12px",
                     fontWeight: "600",
                     whiteSpace: "nowrap",
-                    cursor: "pointer"
+                    cursor: toggling || status === "unknown" ? "not-allowed" : "pointer",
+                    opacity: toggling || status === "unknown" ? 0.7 : 1
                   }
-                }, form.enabled ? "已开启" : "已关闭")
+                }, cloudTunnelButtonText)
               ])
             ]),
 
